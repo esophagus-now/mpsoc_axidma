@@ -1,0 +1,309 @@
+========
+OVERVIEW
+========
+
+As an example of writing a more usable driver for an IP core in the FPGA, I'm 
+using the AXI DMA as an example. That way, I write some docs and get a driver 
+that we all really need!
+
+This file will flesh out how each of the following subtasks is adapted for use 
+with the AXI DMA:
+
+    - Mapping device memory
+    - Writing the interrupt handler
+    - Creating the sysfs attribute files
+    - Registering the whole with UIO
+
+The intended programming sequence with this driver is as follows:
+    1. Write the desired base address into /sys/axidma/phys_base
+    2. Write the desired IRQ number into /sys/axidma/irq_line
+    3. Write a "1" into /sys/axidma/enable
+    4. Figure out which /dev/uioX corresponds to the AXI DMA driver. This is 
+       what I dislike about UIO: you can't name the device file!
+    5. open() the device file
+    6. mmap() the device file in
+    7. Twiddle with whatever registers you need to twiddle
+    8. read() the device file to wait for an interrupt
+    9. close() the device file.
+
+And if you plan to reprogram the bitstream,
+    10. Write a "0" into /sys/axidma/enable
+
+For the sake of being understandable, I've left out the error-checking code. 
+However, the error-checking code is extremely important, and will be in the 
+final version
+
+========
+GLOSSARY
+========
+
+Before we get started, here's a quick "glossary" of the different moving parts:
+
+GLOBAL VARIABLES & SYSFS FUNCTIONS
+----------------------------------
+
+axidma_virt (global void*):    
+    The pointer to the AXI DMA's register space
+
+in_use (global int):
+in_use_mutex (global mutex):
+    A global variable that keeps track of whether someone is using the driver. 
+    We only allow one user at a time. Furthermore, we disallow editing the 
+    sysfs attribute files while the driver is in use. We need a mutex here to 
+    avoid race conditions. 
+
+axidma_enabled (global int):
+enable_show (function):
+enable_store (function):
+    We will be creating a sysfs file called "enable" which will manage the 
+    value of the axidma_enabled global variable. The enable_show and _store 
+    functions not only query/set the variable, but they also trigger other 
+    actions.
+    
+    Specifically, the enable_store function will take care of registering and 
+    unregistering the UIO device struct.
+
+axidma_phys_base (global unsigned long):
+phys_base_show (function):
+phys_base_store (function):
+    A global variable and associated sysfs functions for managing it. This 
+    physical address is what gets mapped into axidma_virt.
+
+axidma_irq_line (global int):
+irq_line_show (function):
+irq_line_store (function):
+    A global variable and associated sysfs functions for managing it. We will 
+    internally translate this IRQ number from 0-7 into the correct number for 
+    using UIO.
+
+DEVICE-HANDLING FUNCTIONS
+-------------------------
+
+axidma_open (function):
+    Called when the user open()s the device file (once it has been created by 
+    UIO). Basically just sets in_use to 1.
+
+axidma_release (function):
+    Called when the user close()s the device file. Sets in_use to 0.
+
+axidma_irq_handler (function):
+    Handles the interrupt from the AXI DMA. Using axidma_virt, accesses the AXI 
+    DMA's registers to acknowledge the interrupt.
+    
+
+OTHER BOOKKEEPING
+-----------------
+
+axidma_root_kobj (global struct kobject *):
+    The kobject we'll be using to hook up sysfs entries
+
+axidma_enable_attr (global struct kobj_attribute):
+axidma_phys_base_attr (global struct kobj_attribute):
+axidma_irq_line_attr (global struct kobj_attribute):
+    The kobj_attribute structs associated with our sysfs files
+
+axidma_uio_mem (global struct uio_mem):
+axidma_uio_info (global struct uio_info):
+axidma_device (global struct device):
+    The structs used to register the UIO driver.
+    
+axidma_init (function):
+    The module init function. Registers our sysfs files and nothing else.
+
+axidma_exit (function):
+    The module exit function. Deregisters the sysfs files.
+
+
+=====================
+MAPPING DEVICE MEMORY
+=====================
+
+I haven't mentioned this anywhere else yet, but the kernel uses virtual 
+addresses. This means you can't just use a physical address to access device 
+memory, you need to create a "mapping". Essentially, this means editing the 
+kernel's page tables to give you access to a specific physical address.
+
+We will be using ioremap_nocache and iounmap to manage these mappings.
+
+Specfically, we will have a global variable:
+    
+    void *axidma_virt = NULL;
+
+Normally I would perform the mapping in the module init function (as is done in 
+the simpler UIO tutorial) but in this case we'll do it in the enable_store 
+function:
+
+    static ssize_t enable_store (struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+    {
+        ...
+        if (we_are_now_enabled) {
+           axidma_virt = ioremap_nocache(axidma_phys_base, 0x1000);
+        } else {
+            iounmap(axidma_virt);
+        }
+        ...
+    }
+
+Note: in the final implementation we'll actually check if the base address is 
+within the range of addresses assigned to the FPGA. If not, we'll return an 
+error.
+
+
+=============================
+WRITING THE INTERRUPT HANDLER
+=============================
+
+First, we check a specific status bit in the AXI DMA's registers to see if the 
+interrupt was meant for us. If so, we clear the bit, and signal to the kernel 
+that we handled the interrupt. Otherwise, we signal that the interrupt must 
+have been for someone else.
+
+Basically, I just checked the register space in the AXI DMA documentation. 
+There are a handful of bits you need to check to see if an interrupt happened, 
+then you just write a '1' to clear the flag.
+
+    static irqreturn_t axidma_irq_handler(int irq, struct uio_info *dev) {
+        uint32_t *MM2S_DMASR = (uint32_t*) axidma_virt;
+        uint32_t *S2MM_DMASR = (uint32_t*) (axidma_virt + 0x30);
+        
+        if (((*MM2S_DMASR >> 12) & 0b111) || ((*S2MM_DMASR >> 12) & 0b111)) {
+            *MM2S_DMASR = 0xFFFFFFFF;
+            *S2MM_DMASR = 0xFFFFFFFF;
+            return IRQ_HANDLED; 
+        }
+        
+        return IRQ_NONE; 
+    }
+
+Note that we really should be more careful to only clear the flags that were 
+set, in case new interrupts occurred while we're the handler. To be honest, 
+this seems kind of rare, especially since we only allow one user at a time.
+
+
+==================================
+CREATING THE SYSFS ATTRIBUTE FILES
+==================================
+
+First, we declare a couple of global variables:
+
+    struct kobject *axidma_kobject;
+    struct kobj_attribute axidma_enable_attr, axidma_phys_base_attr, axidma_irq_line_attr;
+
+Then, we'll fill them in and register them in the module init function:
+
+    static int __init axidma_init(void) {
+        ...
+        axidma_kobject = kobject_create_and_add("axidma", NULL);
+        
+        axidma_enable_attr.attr.name = "enable";
+        axidma_enable_attr.attr.mode = 0664;
+        axidma_enable_attr.show = enable_show;
+        axidma_enable_attr.store = enable_store;
+        
+        axidma_phys_base_attr.attr.name = "phys_base";
+        axidma_phys_base_attr.attr.mode = 0664;
+        axidma_phys_base_attr.show = phys_base_show;
+        axidma_phys_base_attr.store = phys_base_store;
+        
+        axidma_irq_line_attr.attr.name = "irq_line";
+        axidma_irq_line_attr.attr.mode = 0664;
+        axidma_irq_line_attr.show = irq_line_show;
+        axidma_irq_line_attr.store = irq_line_store;
+        
+        sysfs_create_file(axidma_kobject, &(axidma_enable_attr.attr));
+        sysfs_create_file(axidma_kobject, &(axidma_phys_base_attr.attr));
+        sysfs_create_file(axidma_kobject, &(axidma_irq_line_attr.attr));
+        ...
+    }
+
+Except for the extra work done in enable_store, the general format of the show 
+and store commands is:
+
+        static ssize_t X_show  (struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+        {
+            return sprintf(buf, "%d\n", X);
+        }
+        
+        static ssize_t X_store (struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+        {
+            //Check if the driver is in use
+            mutex_lock(&in_use_mutex);
+            if (in_use) {
+                printk(KERN_ERR "Error! Cannot modify parameters while AXI DMA is in use\n");
+                mutex_unlock(&in_use_mutex);
+                return count;
+            }
+            mutex_unlock(&in_use_mutex);
+            
+            sscanf(buf, "%d", &X);
+            return count; 
+        }
+    
+(for brevity, the error handling code is not shown)
+
+Finally, clearing out the sysfs files is exceedingly simple, and is done in the 
+module exit function:
+
+    void __exit axidma_exit(void) {
+        kobject_put(axidma_kobject);
+    }
+
+
+==================================
+REGISTERING/UNREGISTERING WITH UIO
+==================================
+
+This is done inside the enable_store function. We have a couple of jobs to do: 
+    - Get the correct IRQ number from the value in irq_line
+    - Fill the uio_mem struct. Uses the value in phys_base
+    - Fill the uio_device struct and register it.
+
+
+
+    static ssize_t enable_store (struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+    {
+        ...
+        if (we_are_now_enabled) {
+            /***Begin complicate business of finding IRQ number***/
+            struct device_node *dn;
+            struct irq_domain *dom;
+            struct irq_fwspec dummy_fwspec = {
+                .param_count = 3,
+                .param = {0, 89 + irq_line, 4} 
+            };
+            int virq;
+
+            //Find the Linux irq number
+            dn = of_find_node_by_name(NULL, "interrupt-controller");
+            dom = irq_find_host(dn);
+
+            dummy_fwspec.fwnode = dom->fwnode;
+            virq = irq_create_fwspec_mapping(&dummy_fwspec);
+            /***End of complicated business of finding IRQ***/
+            
+            axidma_uio_info.irq = virq;
+            axidma_uio_mem.addr = phys_base;
+            
+            uio_register_device(&axidma_device, &axidma_uio_info);
+        } else {
+            uio_unregister_device(&axidma_uio_info);
+        }
+        ...
+    }
+
+Again, the error handling code (which is super important) is omitted for 
+brevity.
+
+
+============
+OTHER THINGS
+============
+
+There's a couple of other things that are in the final implementation, but that 
+are not in this document:
+
+    - The struct device stuff
+    - The axidma_open() and axidma_release() functions
+    - The userspace code, which also relies on the pinner module
+
+Well, there you go.

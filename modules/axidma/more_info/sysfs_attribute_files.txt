@@ -1,0 +1,201 @@
+========
+OVERVIEW
+========
+
+The fundamental structure here is the kobject. This is a general-purpose struct 
+used in A LOT of places throughout the kernel. Generally speaking, every 
+kobject corresponds to a folder in sysfs (and I think they can also correspond 
+to files as well, but I'm a little fuzzy on this).
+
+In other words, if you makea kobject and register it with sysfs, a new folder 
+(or maybe a file?) will be created somewhere in /sys. It's actual name, 
+location, permissions, etc. depend on what you stored inside it.
+
+In our case, we will first register a kobject for our module, which will create 
+a folder somewhere in /sys. Then, we will create a number of kobj_attribute 
+structs (which will contain pointers functions in our module). By calling 
+sysfs_create_file, these attributes will become files in the folder 
+corresponding to our kobject. When a user reads or writes to these files, the 
+functions we registered in the kobj_attribute structs will be called.
+
+
+====================
+CREATING THE KOBJECT
+====================
+
+This is pretty easy. Just do:
+
+    struct kobject *my_kobject = kobject_create_and_add("my_name", NULL);
+
+kobjects are always dynamically allocated. The kobject_create_and_add function 
+will allocate the memory, and also register the kobject with sysfs. Convenient!
+
+Notice the second argument to that function: it's NULL. If you put a NULL here, 
+the folder will be created in the /sys directory. If instead you want to the 
+kobject in a different directory, pass the desired parent directory as the 
+second argument. For example,
+
+    struct kobject *my_other_kobject = kobject_create_and_add("my_other_name", my_kobject);
+
+Now there will be a folder in /sys called /sys/my_name, and inside that folder 
+will be /sys/my_name/my_other_name.
+
+
+To free the kobject (thus removing the entries in sysfs) call:
+
+    kobject_put(my_other_kobject); //Should free children first
+    kobject_put(my_kobject);
+
+
+==================================
+FILLING IN A KOBJ_ATTRIBUTE STRUCT
+==================================
+
+Each kobj_attribute struct will become a file in the folder corresponding to 
+our kobject.
+
+The struct itself is quite simple:
+
+    //Found in include/linux/kobject.h
+    struct kobj_attribute {
+        struct attribute attr;
+        ssize_t (*show)(struct kobject *kobj, struct kobj_attribute *attr,
+                char *buf);
+        ssize_t (*store)(struct kobject *kobj, struct kobj_attribute *attr,
+                 const char *buf, size_t count);
+    };
+
+attr
+----
+    This sets the file name and permissions. The attribute struct is quite 
+    simple:
+    
+        struct attribute {
+            const char		*name;
+            umode_t			mode;
+        };
+
+    For example, you could do:
+    
+    struct kobj_attribute my_atrtibute;
+    my_attribute.attr.name = "my_global_var";
+    my_attribute.attr.mode = 0664; //RW for owner and group, RO for global
+    my_attribute.show = my_show;
+    my_attribute.store = my_store;
+    
+    See below for examples of show and store.
+
+show
+----
+    This function is called when the user reads from the attribute file. Its 
+    arguments are:
+    
+        - kobj: A pointer to the kobject which is the parent of this attribute 
+                file
+        
+        - attr: A pointer to the kobj_attribute associated with the attribute 
+                file. This argument is given to allow the same function to be 
+                used for more than one attribute file. That way, the function
+                can figure out which file is being read from
+        
+        - buf:  Write a string to this buffer. This is what will get returned 
+                to the user. I don't know how much space is here, but you 
+                probably don't need more than 32 bytes anyway (and it's 
+                definitely big enough for that). 
+    
+    It should return the number of bytes written to the buffer.
+    
+    Here is an example. Supposing there is an int called my_global_variable, 
+    this function will print it out to the user:
+    
+        static ssize_t my_show  (struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+        {
+            return sprintf(buf, "Some value: \n", my_global_variable);
+        }
+        
+
+store
+-----
+    This function is called when the user writes to the attribute file. Its 
+    arguments are:
+    
+        - kobj: A pointer to the kobject which is the parent of this attribute 
+                file
+        
+        - attr: A pointer to the kobj_attribute associated with the attribute 
+                file. This argument is given to allow the same function to be 
+                used for more than one attribute file. That way, the function
+                can figure out which file is being read from
+        
+        - buf:  Buffer containing the string from the user
+        
+        - count: Number of bytes in the buffer
+    
+    It should return the number of bytes read from the buffer (this is almost 
+    always equal to count).
+    
+    Here is an example. This sets my_global_variable from what the user gave, 
+    and also bothers to check that the input was valid:
+    
+        static ssize_t my_store (struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+        {
+            if (sscanf(buf,"%d",&my_global_variable) != 1) {
+                printk(KERN_ERR "WARNING: could not parse integer from user input!\n");
+                return count;
+            }
+            return count; //All is well
+        }
+    
+
+=============================
+REGISTERING IT ALL WITH SYSFS
+=============================
+
+There is only one function to call:
+
+    retval = sysfs_create_file(my_other_kobject, &(my_attribute.attr));
+    if (retval) {
+        printk(KERN_ERR "Error, could not create file for some reason\n");
+        goto error_handling_code;
+    }
+
+You don't even need to free it; that happens automatically when you call 
+kobject_put!
+
+At the end of this example, in sysfs you should have:
+
+sys/
+    my_name/
+        my_other_name/
+            my_global_var
+
+
+
+===========
+DEEPER INFO
+===========
+
+
+
+
+(You don't need to know this)
+
+
+
+
+Just in case you were curious, the kobject_create_and_add function sets the 
+ktype of the kobject to be a default value. Specifically, this is the (globally 
+defined) dynamic_kobj_type. 
+
+Why is this important? Well, because sysfs uses only attribute structs and 
+sysfs_ops structs. It is the sysfs_ops struct which contains the show and store 
+functions that the kernel will call; the dynamic_kobj_type's sysfs_ops struct 
+is what actually delegates to the show and store functions in your 
+kobj_attribute struct.
+
+    To go even deeper: these default show and store functions will use the 
+    container_of macro to find the kobj_attribute that contains the attribute 
+    struct.
+
+Okay, but why should you care? Because this tells you not to set the ktype of 
+your kobject.

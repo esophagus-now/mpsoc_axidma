@@ -1,0 +1,74 @@
+For full details, read mpsoc_programming/drivers/writing_uio_drivers.txt
+
+A UIO driver for a device with a few registers and an interrupt line needs:
+
+    - An interrupt handler
+    - A uio_mem struct (one for each memory region you need)
+    - A uio_info struct
+    - A dummy struct device (unfortunately)
+
+Here's a skeleton of these things:
+
+Interrupt handler
+-----------------
+
+    static irqreturn_t my_handler(int irq, struct uio_info *dev) {
+        
+        if (<<interrupt was for us>>) {
+            <<clear interrupt bit in hardware, if needed>>
+            return IRQ_HANDLED; 
+        }
+        
+        return IRQ_NONE; 
+    }
+
+
+uio_mem struct
+--------------
+
+    static struct uio_mem my_mem_region = {
+        .name = "my_region",
+        .memtype = UIO_MEM_PHYS,
+        .addr = <<base address, should be word-aligned>>
+        .size = <<number of bytes>>
+    };
+
+
+uio_info struct
+---------------
+
+    static struct uio_info my_info = {
+        .name = "my_name",
+        .version = "1.0",
+        .irq = <<your IRQ number. Be careful! See below>>,
+        .irq_flags = IRQF_SHARED,
+        .handler = my_handler
+    };
+    
+    my_info.mem[0] = &my_mem_region;
+    
+    //The interrupt number is a real pain in the rear end. See 
+    //interrupt_numbers_refresher.txt
+    
+Dummy struct device
+-------------------
+
+    static void dummy_release(struct device *dev) {
+        return;
+    }
+
+    static struct device my_dummy_dev = {
+        .init_name = "my_name",
+        .release = dummy_release
+    };
+
+
+
+After all that, simply call
+
+    uio_register_device(&my_dummy_dev, &my_info);
+
+And at the end, call:
+    
+    uio_unregister_device(&my_info);
+    device_unregister(&my_dummy_dev);

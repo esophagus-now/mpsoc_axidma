@@ -1,0 +1,33 @@
+Getting the interrupt number for your desired IRQ line in the PL is not 
+trivial. This file only gives a recipe for doing it; for more details, see
+linux_kernel_programming/interrupt_numbers.txt
+
+    struct device_node *dn;
+    struct irq_domain *dom;
+    struct irq_fwspec dummy_fwspec = {
+        .param_count = 3,
+        .param = {0, 89 + <<PL IRQ number>>, 4} 
+    };
+    int virq;
+    
+    //Find the Linux irq number
+    dn = of_find_node_by_name(NULL, "interrupt-controller");
+    if (!dn) {
+        printk(KERN_ERR "Could not find device node for \"interrupt-controller\"\n");
+        goto /*error_handler*/;
+    }
+    dom = irq_find_host(dn);
+    if (!dom) {
+        printk(KERN_ERR "Could not find irq domain\n");
+        goto /*error_handler*/;
+    }
+    
+    dummy_fwspec.fwnode = dom->fwnode;
+    virq = irq_create_fwspec_mapping(&dummy_fwspec);
+    
+    ////use virq in your uio_info struct, such as:
+    //my_info.irq = virq;
+
+For reasons I won't get into here, you have to add 89 to your IRQ number in 
+that irq_fqspec struct. That is, if you use bit 2 of the IRQ port on the Zynq, 
+you need to put 91 there.
