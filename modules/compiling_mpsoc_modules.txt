@@ -1,0 +1,124 @@
+========
+OVERVIEW
+========
+
+When compiling a Linux kernel module, you need two things:
+
+1) Header files with definitions of all the structs, macros, and 
+   globals your might use in your module source
+	
+2) A bunch of very complicated scripts that deal with the linker. I 
+   call this the "build environment".
+
+It makes sense why we need 1), but 2) is more subtle. Essentially, the
+machine code in a kernel module has some very specific requirements that
+the regular compiler will not do by default.   
+
+	Luckily, the "complicated scripts" are actually very easy to use. 
+	The kernel developers have this "KBuild" system which takes care of 
+	all the difficulty. I definitely don't know how it works, but I 
+	thought I would give you the name in case you wanted to look it up.
+
+Everything is available from the Linux kernel sources, though you need 
+to make sure it is configured correctly, and there is one extremely 
+subtle think you have to fix involvign "magic strings". Once the source 
+tree is properly configured, you just have to write one very simple 
+makefile.
+
+
+========================================================
+OBTAINING THE CORRECT HEADER FILES AND BUILD ENVIRONMENT
+========================================================
+
+First, you need the source code for the Linux kernel. We won't actually 
+compile it, but our module will be referencing the headers from the 
+source tree. Clone the repo from below, and checkout the xilinx-v2018.1 
+tag. You need the sources to exactly match what was used to make the 
+kernel running on the MPSoC.
+
+	https://github.com/Xilinx/linux-xlnx
+
+You need to configure the kernel for the MPSoC, and specifically, 
+configure it so it exactly matches the kernel we're using right now. It
+turns out that Linux has a really great feature: the config is saved on
+the running system! Copy /proc/config.gz to your dev computer.
+
+Before we start, let's set some environment variables. The Linux kernel
+needs to be cross-compiled, and the makefiles will use these variables
+to select the right compiler:
+
+	export ARCH=arm64
+	export CROSS_COMPILE=aarch64-linux-gnu-
+
+Unzip that config.gz, and type
+
+	make menuconfig
+
+in the Linux sources. Use the <Load> feature to load the config you 
+copied out from the MPSoC. Then, exit the menu.
+
+At this point, you might think we're ready, but we're not. You need to 
+do
+
+	make modules_prepare
+	
+I'm not sure exactly what this does, but I think it edits the source 
+files based on the configuration. Now, we should be ready to compile our
+module.
+
+=============
+MAGIC STRINGS
+=============
+
+The Linux kernel has something called a "version magic string". This is 
+used whenever you try to insert a module; if the version magic in the 
+module does not EXACTLY match the version magic in the running kernel, 
+the module will not be inserted.
+
+The solution is pretty easy (but quite obscure): in the kernel source 
+tree, open up include/generated/utsrelease.h. In it you should find:
+
+	#define UTS_RELEASE "4.14.0"
+
+For some reason, the kernel running on our boards has:
+
+	savi@mpsoc17:~$ uname -r
+	4.14.0-00002-g3f7dc94
+
+So simply edit utsrelease.h to say
+
+	#define UTS_RELEASE "4.14.0-00002-g3f7dc94"
+
+And that's it! You're now ready to compile modules against this source 
+tree!
+
+For reference, here is a webpage with more details:
+http://billauer.co.il/blog/2013/10/version-magic-insmod-modprobe-force/
+
+
+====================
+COMPILING THE MODULE
+====================
+
+Basically, you write a small Makefile which calls a Makefile from 
+inside the kernel source tree. I always just find one online and edit 
+it (since I'm not too comfortable with Makefiles), and here is the one 
+I always use:
+
+	export ARCH:=arm64
+	export CROSS_COMPILE:=aarch64-linux-gnu-
+
+	CC=$(CROSS_COMPILE)gcc
+
+	obj-m += NAME_OF_YOUR_C_FILE.o
+
+	KDIR  := /path/to/linux-xlnx
+	PWD		:= $(shell pwd)
+
+	default:
+		${MAKE} -C ${KDIR} M=${PWD} modules
+
+	clean:
+		${MAKE} -C ${KDIR} M=${PWD} clean
+
+Then just type make. Good luck!
