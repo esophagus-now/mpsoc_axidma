@@ -19,6 +19,9 @@
 #define DBG_PRINT
 //#define DBG_PRINT(format, val) fprintf(stderr, #val " = " format "\n", val)
 
+#define DBG_PUTS
+//#define DBG_PUTS(x) fprintf(stderr, "%s\n", x)
+
 //Format of the AXI DMA's registers
 typedef struct {
     uint32_t    MM2S_DMACR;
@@ -140,11 +143,11 @@ sg_list *axidma_list_new(void *sg_buf, physlist const *sg_plist,
 void axidma_free_list(sg_entry *sentinel) {    
     //Step through linked list and free all the entries
     sg_entry *e = sentinel->next;
-    do {
+    while (e != sentinel) {
         sg_entry *tmp = e->next;
         free(e);
         e = tmp;
-    } while (e != sentinel);
+    }
 }
 
 //Free an sg_list object
@@ -356,6 +359,13 @@ static void s2mm_write_sg_entry(void *sg_buf, physlist const *sg_plist, sg_entry
     desc->control.sof = e->is_SOF;
     desc->control.eof = e->is_EOF;
     desc->control.len = e->len;
+    desc->status.complete = 0;
+    desc->status.decode_err = 0;
+    desc->status.eof = 0;
+    desc->status.int_err = 0;
+    desc->status.len = 0;
+    desc->status.slave_err = 0;
+    desc->status.sof = 0;
     desc->buffer_lsb = (uint32_t) (e->buf_phys & 0xFFFFFFFF);
     desc->buffer_msb = (uint32_t) ((e->buf_phys>>32) & 0xFFFFFFFF);
     
@@ -416,6 +426,8 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout) {
     int cnt = 0;
     for (sg_entry *e = lst->sentinel.next; e != &(lst->sentinel); e = e->next) {
         if (e->is_EOF) cnt++;
+        
+        volatile sg_descriptor *desc = (volatile sg_descriptor *) (lst->sg_buf + e->sg_offset);
     }
     
     if (!cnt) {
@@ -428,8 +440,6 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout) {
     //write the pointer to the first descriptor
     volatile axidma_regs *regs = (volatile axidma_regs *) ctx->reg_base;
     
-    //regs->S2MM_DMACR = 0b100; //Perform soft reset. I hope that does something!
-    
     uint64_t curdesc_phys = virt_to_phys(lst->sg_plist, lst->sentinel.next->sg_offset);
     DBG_PRINT("%lx", curdesc_phys);
     DBG_PRINT("%lx", lst->sg_plist->entries[0].addr);
@@ -441,20 +451,36 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout) {
     //Enable all interrupts, set cyclic mode, and set run/stop to 1
     //Also, set timeout to something reasonable?
     
-    regs->S2MM_DMACR = (enable_timeout ? (200<<24) : 0) | ((cnt & 0xFF) << 16) | (0b111000000010001); 
+    regs->S2MM_DMACR = (enable_timeout ? (200<<24) : 0) | ((cnt & 0xFF) << 16) | (0b111000000000001); 
     
     //Now write the pointer to the last descriptor. This starts the transfer
     uint64_t taildesc_phys = virt_to_phys(lst->sg_plist, lst->sentinel.prev->sg_offset);
     regs->S2MM_taildesc_lsb = (uint32_t) (taildesc_phys & 0xFFFFFFFF);
     regs->S2MM_taildesc_msb = (uint32_t) ((taildesc_phys>>32) & 0xFFFFFFFF);
     
+    int maxtries = 5;
+    
     if (wait_irq) {        
         //At this point, transfer has started. Wait for the interrupt!
-        puts("Waiting for DMA to finish!");
+        fprintf(stderr,"Waiting for DMA to finish!\n");
         fflush(stdout);
         
-        unsigned pending;
-        read(ctx->fd, &pending, sizeof(pending));
+        while (1) {
+            DBG_PUTS("Interrupt received");
+            unsigned pending;
+            read(ctx->fd, &pending, sizeof(pending));
+            //Count to see if we have the right number of received buffers
+            int rxcnt = 0;
+            for (sg_entry *e = lst->sentinel.next; e != &(lst->sentinel); e = e->next) {
+                volatile sg_descriptor *desc = (volatile sg_descriptor *) (lst->sg_buf + e->sg_offset);
+                if (desc->status.eof) rxcnt++;
+            }
+            if (rxcnt >= cnt) break;
+            if (!maxtries--) break;
+            DBG_PRINT("%x", regs->S2MM_DMACR);
+            DBG_PRINT("%x", regs->S2MM_DMASR);
+            DBG_PUTS("Need another interrupt!");
+        }
     }
     
     return;
@@ -464,6 +490,7 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout) {
  * Used for traversing buffers returned from an S2MM trasnfer
 */
 s2mm_buf axidma_dequeue_s2mm_buf(sg_list *lst) {
+    DBG_PUTS("Entered dequeue");
     sg_entry *e = lst->to_vist;
     
     if (!e) {
@@ -492,9 +519,27 @@ s2mm_buf axidma_dequeue_s2mm_buf(sg_list *lst) {
     do {
         e = e->next; //This "post-increment" is why we artifically moved e back
         desc = (volatile sg_descriptor *) (lst->sg_buf + e->sg_offset);
-        DBG_PRINT("%d", desc->status.eof);
-        DBG_PRINT("%d", e == &(lst->sentinel));
         
+        
+        DBG_PRINT("%u", desc->control.sof);
+        DBG_PRINT("%u", desc->control.eof);
+        DBG_PRINT("%u", desc->control.len);
+        DBG_PRINT("%u", desc->status.complete);
+        DBG_PRINT("%u", desc->status.decode_err);
+        DBG_PRINT("%u", desc->status.eof);
+        DBG_PRINT("%u", desc->status.int_err);
+        DBG_PRINT("%u", desc->status.len);
+        DBG_PRINT("%u", desc->status.slave_err);
+        DBG_PRINT("%u", desc->status.sof);
+        DBG_PRINT("%08x", desc->buffer_lsb);
+        DBG_PRINT("%08x", desc->buffer_msb);
+        DBG_PRINT("%08x", desc->next_desc_lsb);
+        DBG_PRINT("%08x", desc->next_desc_msb);
+        
+        
+        DBG_PRINT("%d", e == lst->sentinel.prev);
+        DBG_PRINT("%d", e == &(lst->sentinel));
+        DBG_PUTS("--");
         ret.len += desc->status.len;
         
         if (!desc->status.complete || desc->status.decode_err || desc->status.int_err || desc->status.slave_err) {
@@ -509,9 +554,16 @@ s2mm_buf axidma_dequeue_s2mm_buf(sg_list *lst) {
     //Update to_visit
     lst->to_vist = e->next;
     
+    DBG_PUTS("");
     return ret;
 }
 
+/*
+ * Call this function if you want to re-traverse the returned buffers
+*/
+void axidma_reset_lst_traversal(sg_list *lst) {
+    lst->to_vist = lst->sentinel.next;
+}
 
 #undef physlist
 #undef handle

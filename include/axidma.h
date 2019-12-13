@@ -9,7 +9,7 @@
 //Started adding these version tags, cause I'm starting to lose track of what's
 //going on. This code needs to be maintained in several places
 #define AXIDMA_USERLIB_VERSION_MAJOR 1
-#define AXIDMA_USERLIB_VERSION_MINOR 5
+#define AXIDMA_USERLIB_VERSION_MINOR 7
 
 #include "pinner.h"
 
@@ -169,6 +169,11 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout);
  * Used for traversing buffers returned from an S2MM trasnfer
 */
 s2mm_buf axidma_dequeue_s2mm_buf(sg_list *lst);
+
+/*
+ * Call this function if you want to re-traverse the returned buffers
+*/
+void axidma_reset_lst_traversal(sg_list *lst);
 
 #undef physlist
 #undef handle
