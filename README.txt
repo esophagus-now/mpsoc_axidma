@@ -114,7 +114,7 @@ To pin it, you would simply call pin_buf(). This function returns the physical
 address information for this buffer, as well as a handle that you would use in 
 later function calls:
     
-    int pinner_fd = open("/dev/pinner", O_RDWR); //Open the pinner driver
+    int pinner_fd = pinner_open();
     
     struct pinner_physlist my_plist; //Stores physical address information
     struct pinner_handle my_handle; //Stores the handle for flushing/unpinning
