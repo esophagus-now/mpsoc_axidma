@@ -8,11 +8,11 @@ write a device tree overlay.
 # The new AXIDMA library
 
 This repo is meant to be a general attempt to make the AXI DMA easier to use. 
-It includes some custom kernel modules in the modules/ folder, and a userspace 
-library in the include/ and src/ folders.
+It includes some custom kernel modules in the `modules/` folder, and a userspace 
+library in the `include/` and `src/` folders.
 
 This file tries to explain the API for the user library. Check out the READMEs 
-in the modules/pinner/ and modules/axidma/ folders for more information about 
+in the `modules/pinner/` and `modules/axidma/` folders for more information about 
 the drivers themselves.
 
 The background explains virtual memory and pinned pages. Afterwards, I explain 
@@ -87,8 +87,10 @@ or swapped out, the DMA would have no way of knowing this.
 
 ## Overview 
 
-This library does two main things: 1) allow you to pin some of your process's 
-pages, and 2) control the AXI DMA in the FPGA.
+This library does two main things: 
+1. Allow you to pin some of your process's 
+pages, and 
+2. control the AXI DMA in the FPGA.
 
 There's also 1.5) get the physical addresses for your pages. You get this for 
 free when you pin pages.
@@ -133,7 +135,7 @@ while. I hope I can find a way to fix this!
 The handle is basically just a couple of integers that the kernel driver uses 
 to locate information about your buffer. Don't modify them!
 
-The physlist looks like this:
+The `physlist` looks like this:
 ```C
     struct pinner_physlist {
         unsigned num_entries;
