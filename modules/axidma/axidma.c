@@ -30,8 +30,8 @@ static int axidma_irq_line = 0;
 //AXI DMA interrupt handler
 static irqreturn_t axidma_irq_handler(int irq, struct uio_info *dev) {
     //The interrupt flags are in buts 12, 11, and 10 of the status registers
-    uint32_t *MM2S_DMASR = (uint32_t*) axidma_virt;
-    uint32_t *S2MM_DMASR = (uint32_t*) (axidma_virt + 0x30);
+    uint32_t *MM2S_DMASR = (uint32_t*) (axidma_virt + 0x04);
+    uint32_t *S2MM_DMASR = (uint32_t*) (axidma_virt + 0x34);
     
     if (!axidma_virt) {
         printk(KERN_ALERT "REALLY BAD ERROR: AXI DMA interrupt triggered, but no way to access its registers!\n");
@@ -39,6 +39,7 @@ static irqreturn_t axidma_irq_handler(int irq, struct uio_info *dev) {
     }
     
     if (((*MM2S_DMASR >> 12) & 0b111) || ((*S2MM_DMASR >> 12) & 0b111)) {
+        printk(KERN_INFO "MM2S_DMASR: %x, S2MM_DMASR: %x\n", *MM2S_DMASR, *S2MM_DMASR);
         *MM2S_DMASR = 0xFFFFFFFF;
         *S2MM_DMASR = 0xFFFFFFFF;
         return IRQ_HANDLED; 

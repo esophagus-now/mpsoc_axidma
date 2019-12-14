@@ -458,29 +458,16 @@ void axidma_s2mm_transfer(axidma_ctx *ctx, int wait_irq, int enable_timeout) {
     regs->S2MM_taildesc_lsb = (uint32_t) (taildesc_phys & 0xFFFFFFFF);
     regs->S2MM_taildesc_msb = (uint32_t) ((taildesc_phys>>32) & 0xFFFFFFFF);
     
-    int maxtries = 5;
-    
     if (wait_irq) {        
         //At this point, transfer has started. Wait for the interrupt!
         fprintf(stderr,"Waiting for DMA to finish!\n");
         fflush(stdout);
         
-        while (1) {
-            DBG_PUTS("Interrupt received");
-            unsigned pending;
-            read(ctx->fd, &pending, sizeof(pending));
-            //Count to see if we have the right number of received buffers
-            int rxcnt = 0;
-            for (sg_entry *e = lst->sentinel.next; e != &(lst->sentinel); e = e->next) {
-                volatile sg_descriptor *desc = (volatile sg_descriptor *) (lst->sg_buf + e->sg_offset);
-                if (desc->status.eof) rxcnt++;
-            }
-            if (rxcnt >= cnt) break;
-            if (!maxtries--) break;
-            DBG_PRINT("%x", regs->S2MM_DMACR);
-            DBG_PRINT("%x", regs->S2MM_DMASR);
-            DBG_PUTS("Need another interrupt!");
-        }
+        unsigned pending;
+        read(ctx->fd, &pending, sizeof(pending));
+        DBG_PRINT("%x", regs->S2MM_DMACR);
+        DBG_PRINT("%x", regs->S2MM_DMASR);
+        DBG_PUTS("Interrupt received");
     }
     
     return;
