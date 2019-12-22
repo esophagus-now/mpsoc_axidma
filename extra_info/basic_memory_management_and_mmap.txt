@@ -1,0 +1,208 @@
+This is a working draft.
+
+The main references I am using are the excellent Linux Device Drivers 3rd 
+Edition (which is available for free [legally]) here:
+
+	https://lwn.net/Kernel/LDD3/
+	
+and actual code examples from drivers.
+
+Also, I just found this:
+https://cirosantilli.com/x86-paging
+
+Looks helpful
+
+
+TODO list for this file:
+
+[ ] Add address translation examples
+[ ] Figure out what the hell high and low memory is
+[ ] What is the point of kernel logical addresses? Who takes care of subtracting
+    the constant offset when a logical address is dereferences?
+[ ] Ask Camilo about how the PID is in the virtual address, since I can't 
+    remember the details.
+[ ] Add sections on the structs used in the Linux kernel to maintain info on:
+    - Pages
+    - Process address maps
+    - struct vma
+[ ] Explain how to write your own mmap
+[ ] Explain how to access physical addresses in kernel mode (in the case where 
+    you just want to twiddle a few memory-mapped registers)
+
+
+
+First of all, Linux has these infuriating terms called "high" and "low" memory. 
+For the life of me I can't figure out the precise meaning of these terms. It 
+doesn't help that LDD3 mostly talks about 32 bit systems.
+
+From what I understand, the basic moving parts are as follows:
+
+Memory Management Unit (MMU):
+	Whenever the processor requests memory at a particular address, the MMU 
+	will intercept the address and translate it. The address specified by 
+	the CPU is called the "virtual" address, and the address output by the 
+	MMU is the physical address (i.e. the actual pattern of voltages that 
+	will travel down the system bus).
+	
+	Modern MMUs have a ton of features. For example, an operating system 
+	can conspire with the MMU to give each process a different mapping from 
+	virtual to physical addresses. 
+	
+	Since we live in a world where memory is expensive and finite, it is 
+	not possible to store an entire virtual<=>physical mapping for even a 
+	single process (let alone the hundreds of processes that are normally 
+	running). So, there are techniques to only compute the mapping when 
+	needed. These are discussed below.
+
+Translate Lookaside Buffer (TLB):
+	The centerpiece of the MMU. This is nothing more than a table with N 
+	rows and two columns in the MMU (N is determined by how large the MMU 
+	designers wanted to make it). 
+	
+	When a virtual address comes in, some subset of its upper bits is 
+	compared against the first column of each entry; if any of them match, 
+	then the address's upper bits are replaced the value in the second 
+	column. This is now the physical address.
+	
+		NOTE: the TLB entries laos have a number of extra bits. For 
+		example, setting the permissions to user or supervisor. Intel 
+		has a couple thousand pages of documentation, and somewhere in 
+		there the bits are defined. I am looking at page 120 of the 
+		"Software Developer's Manual".
+	
+	If no entries match, one of two things can happen: either the CPU 
+	receives an interrupt and the OS will re-manage the TLB entries 
+	manually, or the OS can preload a CPU register with the address of a 
+	larger table in RAM and the TLB will replace its own entries. The first 
+	method is called "software replacement" and the second is called 
+	"hardware replacement". It's not clear at all which one Linux uses.
+
+Page:
+	Remember earlier how the TLB simply replaces some subset of the upper 
+	bits of an address? Well, in most modern systems, this is the top 52 
+	bits, leaving the lower 12 bits unchanged. This means that we don't 
+	have a mapping for each and every byte; instead we can only map chunks 
+	of memory which are 2^12 bytes in size (and the lower 12 bits of the 
+	address are an offset into this chunk). These chunks are called pages.
+
+TLB Misses:
+	When the TLB is in software replacement mode, all misses are signaled 
+	back to the OS via an interrupt. When it is in hardware replacement 
+	mode, it will also signal the OS if there was no matching entry in the 
+	larger page tabe in RAM.
+	
+	At this point, the OS is responsible for evicting an old TLB entry and 
+	replacing it with a new one. There are no rules for how the OS must do 
+	this; instead, it is an interesting engineering problem to design 
+	efficient data structures to describe the mapping for all processes 
+	without consuming huge amounts of RAM.
+
+Multi-Level Page Tables:
+	The solution used by Linux for handling TLB misses is to essentially 
+	build a 1024-ary tree for each page. I have a basic idea how this 
+	works, since Camilo was kind enough to explain it to me one day, but 
+	I'll have to think for a little while to find a clean way to present it 
+	here.
+	
+	By the way, Camilo once told me that Linux has in important 
+	optimization: a process's ID is used as part of the virtual addresses 
+	or something. This lets the kernel perform context switches without 
+	having to invalidate the whole TLB. However, I'm not familiar with all 
+	the details.
+
+Swapped Pages:
+	Essentially, when the kernel notices that a page in RAM has not been 
+	used very much, it can take that whole 4 KB page and just save it to 
+	the hard disk. This opens up space in RAM for pages that are used more 
+	often.
+	
+	I'm not really aware of the precise details of how this is performed. 
+	Clearly, the kernel needs to invalidate any page table entries that 
+	reference the original memory. That way, the next time somebody asks 
+	for that memory, it will trigger a fault and the kernel can read the 
+	data back in from the disk.
+	
+	I guess this means that every page has a unique address in the 64 bit 
+	address space, whether it is on the disk or in RAM.
+
+Process Address Space:
+	A process is free to use any 64 bit address it wants. The OS will take 
+	care of maintaining TLB entries so that these addresses get mapped to 
+	the correct physical addresses (and it will load any swapped pages in 
+	to RAM if necessary). Additionally, the OS reserves to right to kill 
+	the process if it tries anything suspicious. After all, the OS knows 
+	exactly which memory a process is allowed to use, since it must manage 
+	it in the first place.
+	
+	Here's something important: whenever a system call is made, we will 
+	start executing kernel code (in supervisor/ring0 mode). The kernel, 
+	like any user process, still uses virtual memory, and the addresses it 
+	asks for go through the exact same MMU and TLB translation mechanisms.
+	
+	Here's the thing: suppose that a user process used virtual address 
+	0x1000, and that the kernel used virtual address 0x1000. Well, if we do 
+	a system call, the TLB entry for virtual address 0x1000 will be 
+	replaced with the correct mapping for the kernel. 
+	
+	This is not a problem, but it does cause performance to degrade. If 
+	this example process makes several system calls during its lifetime, 
+	there will be /two/ TLB misses for 0x1000 for each of these calls (one 
+	in the kernel, and one when control is returned to the user process).
+	
+	So, as a performance optimization, the kernel's virtual addresses all 
+	have a 1 as the most significant bit of their addresses (bit 63), 
+	whereas all user processes all have a 0 as the most significant bit. 
+	Technically this means that a user process can only ever have an 
+	address space of size 2^63 instead of 2^64, but who cares? That's 
+	already a ton of memory. Anyway, the net result is that kernel virtual 
+	addresses never clobber use virtual addresses.
+
+Kernel structures for maintaining memory map information:
+	
+	struct mm_struct: Each process has one of these structs, which contains 
+	all the information about that process's memory map. This includes 
+	pointers to page tables, as well as a number of "virtual memory area" 
+	structs, described below.
+	
+	struct vm_area_struct: Strictly speaking, the only thing a process 
+	needs is its page tables. However, what happens if a page fault occurs? 
+	In one case, the process is accessing memory it's not allowed to touch, 
+	and the kernel will signal a segfault. However, it's also possible that 
+	the process accessed memory that it did have permission to touch, and a 
+	specific page fault handler needs to be called. Each "section" of a 
+	process's address space is represented by one of these structs.
+
+Kernel functions for managing memory maps:
+
+	remap_pfn_range
+	---------------
+	This function is a little weird. First, the prototype:
+		int remap_pfn_range(
+			struct vm_area_struct *vma,
+			unsigned long virt_addr, unsigned long pfn,
+			unsigned long size, pgprot_t prot
+		);
+	For some reason, it takes a vm_area_struct as a parameter, and yet also 
+	asks for a virtual address, size, and protection info. I mean, it could 
+	get this info from the VMA struct; in fact, all mmap code I've ever 
+	seen will just set 
+		virt_addr = vma->vm_start
+		size = (vma->vm_end-vma->vm_start)
+		prot = vma->vm_page_prot
+	Kinda silly.
+	
+	Anyway, this function simply edits the page tables of the process who 
+	owns the VMA struct so that (virt_addr) maps to the physical address 
+	(pfn << PAGE_SHIFT), and so that (virt_addr + 1 page) maps to 
+	(pfn<<PAGE_SHIFT + 1 page), etc. for the size specified in size. The 
+	prot parameter determines the protection
+	
+	As usual, negative return value signals an error.
+	
+	io_remap_pfn_range
+	------------------
+	This function is almost identical to remap_pfn_range, and on 64 bit 
+	systems, is actually a macro that translates to remap_pfn_range. I 
+	think it's only there so that different architectures can specify 
+	different behaviour.
+	

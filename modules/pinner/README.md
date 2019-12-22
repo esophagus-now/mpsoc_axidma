@@ -100,6 +100,6 @@ This is simply a physical address and a length:
     };
 ```
 
-# EXAMPLE
+# Example
 
 (moved to userspace_example.c in this folder)

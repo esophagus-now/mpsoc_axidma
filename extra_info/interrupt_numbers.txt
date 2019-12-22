@@ -1,0 +1,640 @@
+Yesterday I started working on doing a UIO tutorial for the MPSoCs. After half 
+an hour I had all the code written and ready to test. However, I ran into a 
+problem that I still haven't fixed 3 hours later:
+
+What on Earth are the Linux interrupt numbers for the PL-to-PS interrupts??
+
+================
+THE FINAL RESULT
+================
+
+At some point I'm gonna do this is in a nice write-up. For now, here is the code:
+
+    struct device_node *dn;
+    struct irq_domain *dom;
+    struct irq_fwspec dummy_fwspec = {
+        .param_count = 3,
+        .param = {0, 89, 4} //change 89 to number for your device
+    };
+    int virq;
+    
+    //Find the Linux irq number
+    dn = of_find_node_by_name(NULL, "interrupt-controller");
+    if (!dn) {
+        printk(KERN_ERR "Could not find device node for \"interrupt-controller\"\n");
+        goto /*error_handler*/;
+    }
+    dom = irq_find_host(dn);
+    if (!dom) {
+        printk(KERN_ERR "Could not find irq domain\n");
+        goto /*error_handler*/;
+    }
+    
+    dummy_fwspec.fwnode = dom->fwnode;
+    virq = irq_create_fwspec_mapping(&dummy_fwspec);
+
+The idea is that we want to call irq_create_fwspec_mapping with all the 
+information it would need to create the irq mapping. For this reason, we get 
+the fwnode field of the irq_domain object for the system's interrupt 
+controller.
+
+********************************************************************************
+
+The next ~600 lines explains the long journey I went through to get to this 
+answer. At some point I'll condense this so that it properly explains the above 
+code.
+
+========================
+ATTEMPT 1: IRQDOMAIN API
+========================
+
+This morning I had the idea to search "linux find irq number from hardware 
+irq". It turned up this post:
+    https://e2e.ti.com/support/processors/f/791/t/507084
+(there was also a completely useless Xilinx forum post as well).
+
+The solution says:
+
+    Hi Vladimir,
+
+    the mapping between Linux irq numbers and HW irq numbers is provided by the irq_domain library.
+    You can check the <linux src>/Documentation/IRQ-domain.txt for complete explanation of this.
+
+    Basicaly to get Linux irq number from hw irq number you use irq_find_mapping() function.
+    To find HW irq number from linux irq number you can use something like:
+
+    unsigned int hw_irq, linux_irq;
+    struct irq_data *irq_data = irq_get_irq_data(linux_irq);
+    hw_irq = irqd_to_hwirq(irqd); /* it just returns irq_data->hwirq */
+
+    Regards,
+    Yordan
+
+Let's try it out!
+
+So, as I was expecting, the first argument to the irq_find_mapping function is 
+a struct irq_domain*. This means I need to find the struct irq_domain for the 
+interrupt controller that manages the PL-to-PS interrupts.
+
+Let's refresh our memory by checking the Zynq technical reference manual: the 
+PL-to-PS interrupts have hardware irq numbers 121-128, and the interrupt 
+controller is the "GIC"? I thought there was more than one GIC...
+
+Anyway, let's poke around the linux source code to find calls to 
+irq_find_mapping; maybe they will tell me how to get the irq_domain:
+    https://elixir.bootlin.com/linux/latest/ident/irq_find_mapping
+and check the "Referenced in X files section".
+
+Well, so far it isn't helpful; I only find people who are managing their own 
+domains, not finding an exiting one.
+
+But that TI forum post is the gift that keeps on giving! The next reply is 
+exactly the problem I have: where do I get the irq_domain?
+
+The answer:
+
+    Hi Vladimir,
+
+    I think you can look for some ideas at virq_debug_show() function in <linux src>/kernel/irq/irqdomain.c, which iterates on all domains and lists all IRQs (it is called if CONFIG_IRQ_DOMAIN_DEBUG is enabled and then you have file /sys/kernel/debug/irq_domain_mapping which you can cat for a list of all IRQs).
+
+    Regards,
+    Yordan
+
+This Yordan guy is a hero!
+
+Well, that function doesn't seem to exist, but they probably just moved the 
+functionality to a different function. I'm now browsing irqdomain.h to see if 
+any functions sound like the thing I need...
+
+Okay: my best bet is irq_find_host. Given a device tree node, it returns a 
+pointer to the irq_domain that it belongs to. You may ask: which device tree 
+node will we use? Easy: the one for the interrupt controller itself.
+
+Looking around in /proc/device-tree, we find:
+    /proc/device-tree/amba_apu@0/interrupt-controller@f9010000
+and printing its compatible string, we see:
+    arm,gic-400arm,cortex-a15-gic
+so, now we just find the device tree API function for getting a node from its 
+compatible string...
+
+I am now browsing through /drivers/of/of.h to see if anything looks right...
+
+Okay: there are several functions called of_find_node_by_<something>. Let's 
+pick the one that looks easiest, and see how other code uses it...
+
+    /**
+     *	of_find_node_by_name - Find a node by its "name" property
+     *	@from:	The node to start searching from or NULL; the node
+     *		you pass will not be searched, only the next one
+     *		will. Typically, you pass what the previous call
+     *		returned. of_node_put() will be called on @from.
+     *	@name:	The name string to match against
+     *
+     *	Returns a node pointer with refcount incremented, use
+     *	of_node_put() on it when done.
+     */
+    struct device_node *of_find_node_by_name(struct device_node *from,
+        const char *name)
+
+Alright! Printing out /proc/device-tree/amba_apu@0/interrupt-controller@f9010000/name
+gives:
+    interrupt-controller
+
+So all this boils down to:
+
+    struct device_node *dn;
+    struct irq_domain *dom;
+    int virq;
+    
+    
+    dn = of_find_node_by_name(NULL, "interrupt-controller");
+    if (!dn) {
+        //handle...
+    }
+    dom = irq_find_host(dn);
+    if (!dom) {
+        //handle...
+    }
+    virq = irq_find_mapping(dom, 121); //121 is the hwirq we want
+    if (virq == 0) {
+        printk(KERN_ERR "Domain does not contain mapping\n");
+    } else {
+        printk(KERN_INFO "The irq number is %d\n", virq);
+    }
+
+Okay, I ran that code, and I discovered that the domain does not contain the 
+mapping. Great.
+
+There are two things that could be going on:
+    1. This mapping is in another domain (unlikely)
+    2. This mapping was never made (likely)
+
+I will first try to eliminate 1 from consideration. I'll go through the device 
+tree in /proc/device-tree and see if there are any other controllers.
+
+savi@mpsoc17:/proc/device-tree$ for f in $(find -name "*interrupt-parent*"); do od -t x1 $f; echo; done
+
+Everything returned "00 00 00 04". (Note: I don't really know what this means, 
+I only know that they're all identical; this tells me they use the same 
+controller)
+
+So now we know it's number 2: the mapping was never made.
+
+So, let's go back to irqdomain.h and see if it looks easy to create the 
+mapping. If so, I might make a tiny kernel module whose only purpose is to 
+create the mappings and then quit.
+
+    /**
+     * irq_create_mapping() - Map a hardware interrupt into linux irq space
+     * @domain: domain owning this hardware interrupt or NULL for default domain
+     * @hwirq: hardware irq number in that domain space
+     *
+     * Only one mapping per hardware interrupt is permitted. Returns a linux
+     * irq number.
+     * If the sense/trigger is to be specified, set_irq_type() should be called
+     * on the number returned from that call.
+     */
+    unsigned int irq_create_mapping(struct irq_domain *domain,
+                    irq_hw_number_t hwirq)
+
+Okay, this is what we need. Don't be tempted by the "use NULL as first argument 
+to use default domain": I looked at the code for looking up the default domain, 
+and the comments say you shouldn't do it. Anyway, we've already found the 
+correct domain.
+
+The really nice thing is that the function will check if the mapping already 
+exists (I know this from looking at the code).
+
+So there we go, problem solved. Simply perform
+    virq = irq_create_mapping(dom, 121);
+and you can take that to the bank.
+
+Interesting... I got interrupt number 57 for it.
+
+(Note: uio_register_device failed with "Function not implemented", which sounds 
+like a different problem, but it could be related to this IRQ business).
+
+Okay: after a little snooping, I've discovered that irq_create_mapping does NOT 
+set the chip field of the IRQ descriptor. This completely explains the ENOSYS. 
+So... I guess we should set it? But how?
+
+Idea #1: see if the irqdomain library makes it possible
+
+From the comments at the top of irqdomain.h:
+
+     * Interrupt controller "domain" data structure. This could be defined as a
+     * irq domain controller. That is, it handles the mapping between hardware
+     * and virtual interrupt numbers for a given interrupt domain. The domain
+     * structure is generally created by the PIC code for a given PIC instance
+     * (though a domain can cover more than one PIC if they have a flat number
+     * model). It's the domain callbacks that are responsible for setting the
+     * irq_chip on a given irq_desc after it's been mapped.
+
+Aha! "It's the domain callbacks that are repsonsible for setting the irq_chip 
+on a given irq_desc after it's been mapped".
+
+Let's see what callbacks are in that irq_domain struct:
+
+    /**
+     * struct irq_domain_ops - Methods for irq_domain objects
+     * @match: Match an interrupt controller device node to a host, returns
+     *         1 on a match
+     * @map: Create or update a mapping between a virtual irq number and a hw
+     *       irq number. This is called only once for a given mapping.
+     * @unmap: Dispose of such a mapping
+     * @xlate: Given a device tree node and interrupt specifier, decode
+     *         the hardware irq number and linux irq type value.
+     *
+     * Functions below are provided by the driver and called whenever a new mapping
+     * is created or an old mapping is disposed. The driver can then proceed to
+     * whatever internal data structures management is required. It also needs
+     * to setup the irq_desc when returning from map().
+     */
+    struct irq_domain_ops {
+        int (*match)(struct irq_domain *d, struct device_node *node,
+                 enum irq_domain_bus_token bus_token);
+        int (*select)(struct irq_domain *d, struct irq_fwspec *fwspec,
+                  enum irq_domain_bus_token bus_token);
+        int (*map)(struct irq_domain *d, unsigned int virq, irq_hw_number_t hw);
+        void (*unmap)(struct irq_domain *d, unsigned int virq);
+        int (*xlate)(struct irq_domain *d, struct device_node *node,
+                 const u32 *intspec, unsigned int intsize,
+                 unsigned long *out_hwirq, unsigned int *out_type);
+        //others...
+    };
+
+Hmmm... that map function is probably already being called in 
+irq_create_mapping... let's check that.
+
+Yes, the function is called (irq_create_mapping calls irq_domain_associate, who 
+takes care of calling the map function).
+
+Okay, now what?
+
+Well, let's write some code to really be sure that the chip field isn't being 
+set:
+
+    struct irq_desc *irqd;
+    
+    irqd = irq_to_desc(virq);
+    printk(KERN_INFO "irqd->irq_data.chip = %p\n", irqd->irq_data.chip);
+    if (irqd->irq_data.chip == NULL || irqd->irq_data.chip == &dummy_irq_chip) {
+        printk(KERN_ERR "No chip has been associated!!\n");
+    } else {
+        printk(KERN_INFO "Chip name is %s\n", irqd->irq_data.chip->name);
+    }
+    
+Okay, this confirms it: in dmesg, it told me the chip name was "none". This 
+corresponds to the irq_no_chip variable (which is not exported as a symbol). 
+Why was I looking for this? In __setup_irq (the function that request_irq 
+eventually calls) it checks if the chip in the irq descriptor is equal to 
+irq_no_chip.
+
+Okay, so we've confirmed the problem. Now we need to fix it.
+
+How do we get the irq_chip for a specific controller? Let's take another poke 
+in /proc/device-tree?
+
+Well, that didn't lead me anywhere, but I had a different idea. I went to the 
+GIC driver to how and where the irq_chip was declared:
+
+(search for IRQCHIP_DECLARE)
+https://elixir.bootlin.com/linux/latest/source/drivers/irqchip/irq-gic.c#L1468
+
+This tells Linux what init function to call when the device tree declares a 
+certain interrupt controller. Looking at the function that GIC hooks up to the 
+compatible string, (gic_of_init)
+https://elixir.bootlin.com/linux/latest/source/drivers/irqchip/irq-gic.c#L1422
+
+Okay, I found something SUUUUPER sketchy: the GIC driver points a pointer to 
+one of its internal structs in irq_domain->host_data (which is a void* that the 
+driver can do whatever it wants with). This internal struct is what contains 
+the irq_chip struct.
+
+So I can use that... but that definitely is dangerous. How do I know which 
+driver controls an irq_domain? Also, is the irq_chip the only thing I need to 
+set in the descriptor?
+
+Okay: let's go back to looking at what everyone else does after calling 
+irq_create_mapping to make sure the chip is the only thing we need.
+    Okay, it looks like all we need is to set the chip, and we can set the 
+    handler to handle_simple_irq (which is globally defined)
+
+This is going nowhere. Let's go back to something we discovered earlier: that 
+the irq_domain callbacks are responsible for setting the chip. Let's look at 
+the GIC's callbacks:
+
+(gic_irq_domain_map function)
+https://elixir.bootlin.com/linux/latest/source/drivers/irqchip/irq-gic.c#L968
+
+It calls irq_set_info, which goes on to set the chip. So why isn't the chip 
+being set on my system??
+
+Well, I notice this line in irq_domain_set_hwirq_and_chip:
+
+	irq_data->chip = chip ? chip : &no_irq_chip;
+
+So if the driver gives it a null pointer, we get no_irq_chip.
+
+Oh, and also, this just sets the irq_data struct inside the irq_domain struct, 
+not necessarily setting the chip and handler in the irq_desc struct (which is 
+what we need).
+
+Let's write some code to see what's written in the irq_domain's irq_data struct:
+    
+    struct irq_data *data;
+    
+    data = irq_domain_get_irq_data(dom, virq);
+    if (data == NULL) {
+        printk(KERN_ERR "Error: hwirq %d does not belong to the domain\n", virq);
+    } else 
+        printk(KERN_INFO "The chip for hwirq %d has name %s\n", virq, data->chip->name);
+    }
+
+Well that's infurating... "The chip for hwirq 57 has name none"
+
+Alright, let's try and figure out exactly which interrupt controller driver is 
+being used. Try looking in /sys/devices?
+
+Okay: I found it by going to /sys/kernel/irq, picking one of the numbers at 
+random, and listing out the chip_name. I got "GICv2". Let's find this string 
+string in the kernel sources...
+
+Well now we've come full circle: we're back in irq-gic.c! 
+
+What the hell is going on???
+
+Okay: beyond the shadow of a doubt, the GIC driver is correctly setting the 
+irq_chip in the irq_data of the irq_domain (complicated enough for you?) This 
+is leading me to believe that maybe the irq_domain I have isn't the right one. 
+Let's see if irq_domains have a name and if I can print mine out...
+
+    printk(KERN_INFO "Using domain with name %s\n", dom->name);
+
+This gives "Using domain with name :amba_apu@0:interrupt-controller@f9010000"
+
+Okay, so the last thing I can think to check is the irq_domain_get_irq_data 
+function I've been using. I noticed when I first looked at it that it wasn't 
+actually setting anything inside the irq_domain; instead, it was finding an 
+irq_data based off the virq.
+
+Oh my God... this is only getting more complicated...
+
+Okay: irq_data structs are stored inside an irq_desc. The irq_create_mapping 
+I've been using SHOULD be setting the irq_data properly, since it calls the map 
+callback in the irq_domain...
+
+Okay, I'm looking at the irq_create_mapping function more carefully. One thing 
+I could check is if there is a map op in the irq_domain struct:
+
+    printk(KERN_INFO "dom->ops.map = %p\n", dom->ops->map);
+
+Holy null pointers batman! "dom->ops.map =           (null)"
+
+Let's take a look at that driver code again... is it not setting the map 
+callback?
+
+Interesting... there are two irq_domain_ops structs. One which has map and 
+unmap, and another which has the others (but no map or unmap). It looks like 
+when there is a device tree, it uses the one without map and unmap...
+
+This isn't necessarily a problem (yet), let's go back and see what 
+irq_create_mapping does when there is no map function... nothing. It just never 
+sets the chip info.
+
+So then how are you supposed to do it???
+
+Alright, after looking at MPSoC 14 (where I used a device tree overlay), it is 
+correctly setting the chip on the irq_desc. (Well, obviously it is, since it 
+works). So let's look at the Xilinx DMA driver, since that is the code that 
+probably hooks up the interrupt.
+
+So irq_of_parse_and_map does the dirty work of mapping the interrupt. This 
+calls irq_create_of_mapping, which calls other stuff... eventually:
+
+	if (irq_domain_is_hierarchy(domain)) {
+		virq = irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, fwspec);
+		if (virq <= 0)
+			return 0;
+	} else {
+		/* Create mapping */
+		virq = irq_create_mapping(domain, hwirq);
+		if (!virq)
+			return virq;
+	}
+
+aha... in the GIC driver, the irq_domain_ops it was regsitering had "hierarchy" 
+in the name. That was what it used if device trees were enabled.
+
+And now we're back to where I was looking yesterday: this extremely ugly 
+irq_domain_alloc_irqs stuff which requires pointers into the device tree... 
+okay, let's look at it again now that I know more about what's going on...
+
+Okay, I don't think this will answer my questions, but I notice that it uses 
+the alloc callback from the irq_domain. Let's look at the one in the GIC 
+driver.
+
+Oh my god.. this alloc function calls the gic_irq_domain_map function! I'm 
+really losing track of what's going on now...
+
+Let's get a little more info out of our irq_domain:
+
+    if (irq_domain_is_hierarchy(dom)) {
+        printk(KERN_INFO "This is a hierarchical domain (whatever that means)\n");
+    }
+
+That confirms this is a "hierarchical domain". 
+
+I'm looking in this crazy device tree irq stuff... for the first time I'm 
+starting to think this is hopeless...
+
+Maybe if I made a dummy device tree node just so that I could call the same 
+irq_of_parse_and_map function?
+
+
+==================================================================
+METHOD #2: TRICK THE DEVICE TREE CODE INTO WIRING UP THE INTERRUPT
+==================================================================
+
+This is extremely hacky. It will only work for the MPSoCs, because it assumes 
+that we are using the GIC driver.
+
+Basically, I looked at a lot of kernel source code, and I have an idea for how 
+to get the interrupt numbers wired up.
+
+The function we want is:
+
+    int irq_domain_alloc_irqs(struct irq_domain *domain, unsigned int nr_irqs, int node, void *arg)
+
+We will call it like this:
+
+    irq_domain_alloc_irqs(dom, 1, NUMA_NO_NODE, &our_fwspec);
+
+What is that fourth argument? Well, the irq_domain_alloc_irqs function will 
+pass it on to the alloc callback of the irq_domain_ops that the driver 
+specified. The GIC driver expects it to be a struct irq_fwspec:
+
+    /**
+     * struct irq_fwspec - generic IRQ specifier structure
+     *
+     * @fwnode:		Pointer to a firmware-specific descriptor
+     * @param_count:	Number of device-specific parameters
+     * @param:		Device-specific parameters
+     *
+     * This structure, directly modeled after of_phandle_args, is used to
+     * pass a device-specific description of an interrupt.
+     */
+    struct irq_fwspec {
+        struct fwnode_handle *fwnode;
+        int param_count;
+        u32 param[IRQ_DOMAIN_IRQ_SPEC_PARAMS];
+    };
+
+The easy part is the param_count and param array. The array will contain the 
+same three numbers we would normally use in our device trees (and param_count 
+will simply be 3).
+
+The struct fwnode_handle is a little trickier. The only way to figure out what 
+to put there is to look at the GIC driver's code. Eventually, it says:
+    
+    //in gic_irq_domain_translate, called from within gic_irq_domain_alloc
+    if (is_of_node(fwspec->fwnode)) {
+        //stuff that we want to have happen...
+    }
+
+Okay, so all we need is for it to pass the is_of_node check. Let's look at that 
+function:
+
+    static inline bool is_of_node(const struct fwnode_handle *fwnode)
+    {
+        return !IS_ERR_OR_NULL(fwnode) && fwnode->ops == &of_fwnode_ops;
+    }
+
+All we need is to make a dummy fwnode_handle struct, and the only thing we need 
+to initialize is its ops member to point to the (globally available) 
+of_fwnode_ops.
+
+So this culminates in the following code WHICH WILL PROBABLY NOT WORK IF YOU 
+AREN'T USING AN MPSOC:
+    
+    virq = irq_find_mapping(dom, 121);
+    if (!virq) {
+        struct fwnode_handle dummy_fwnode = {
+            .ops = &of_fwnode_ops
+        };
+        
+        struct irq_fwspec our_fwspec = {
+            .fwnode = &dummy_fwnode,
+            param_count = 3,
+            param = {0, 89, 4}
+        };
+        
+        printk(KERN_INFO "Allocating descriptor for hwirq 121...\n");
+        
+        irq_domain_alloc_irqs(dom, 1, NUMA_NO_NODE, &our_fwspec);
+    }
+    printk(KERN_INFO "Using linux irq #%d\n", virq);
+
+Ugh, it doesn't work... the symbol isn't exported...
+
+Okay, let's try a hail mary: right above the irq_domain_alloc_irqs function is 
+one called irq_domain_alloc_irqs_hierarchy which takes exactly the same 
+arguments, but is simply:
+
+    int irq_domain_alloc_irqs_hierarchy(struct irq_domain *domain,
+                        unsigned int irq_base,
+                        unsigned int nr_irqs, void *arg)
+    {
+        return domain->ops->alloc(domain, irq_base, nr_irqs, arg);
+    }
+
+No, I took an extra few seconds to take a look... this function is called from 
+inside __irq_domain_alloc_irqs with a bunch of mutex locks and other stuff 
+around it which looks important. Plus, it's also not exported; there is no 
+point in even trying it.
+
+So now what? How on Earth does the Xilinx DMA driver get around this problem? 
+Probably because it's linked into the kernel at build time, and isn't a module.
+
+Okay, new idea: this irq_domain_alloc_irqs function is called by another 
+function which _is_ exported as a symbol:
+
+unsigned int irq_create_fwspec_mapping(struct irq_fwspec *fwspec)
+
+This one is a little more complicated bexause now we have to figure out what to 
+put in fwspec (and the function is much longer...). Well, let's take a look:
+
+    /**
+     * struct irq_fwspec - generic IRQ specifier structure
+     *
+     * @fwnode:		Pointer to a firmware-specific descriptor
+     * @param_count:	Number of device-specific parameters
+     * @param:		Device-specific parameters
+     *
+     * This structure, directly modeled after of_phandle_args, is used to
+     * pass a device-specific description of an interrupt.
+     */
+    struct irq_fwspec {
+        struct fwnode_handle *fwnode;
+        int param_count;
+        u32 param[IRQ_DOMAIN_IRQ_SPEC_PARAMS];
+    };
+
+The second and third fields are the same as what we've already done, but don't 
+get too excited: this function uses fwnode to actually find the irq_domain 
+object. The nice thing is that we won't have to get it ourselves, but the 
+downside is having to set up the struct more carefully. 
+
+The function that finds the matching irq_domain essentially iterates through a 
+global list of all domains:
+
+	list_for_each_entry(h, &irq_domain_list, link) {
+		if (h->ops->select && fwspec->param_count)
+			rc = h->ops->select(h, fwspec, bus_token);
+		else if (h->ops->match)
+			rc = h->ops->match(h, to_of_node(fwnode), bus_token);
+		else
+			rc = ((fwnode != NULL) && (h->fwnode == fwnode) &&
+			      ((bus_token == DOMAIN_BUS_ANY) ||
+			       (h->bus_token == bus_token)));
+
+		if (rc) {
+			found = h;
+			break;
+		}
+	}
+
+The GIC driver does not implement the select or match callbacks. So, as it 
+turns out, we just need our fwnode to match the one in the irq_domain.
+
+Oh, so there was one in there the whole time...
+
+Well okay, we still have to find the irq_domain, but now the code is:
+
+    virq = irq_find_mapping(dom, 121);
+    if (!virq) {        
+        struct irq_fwspec our_fwspec = {
+            .fwnode = dom->fwnode,
+            .param_count = 3,
+            .param = {0, 89, 4}
+        };
+        
+        printk(KERN_INFO "Allocating descriptor for hwirq 121...\n");
+        
+        virq = irq_create_fwspec_mapping(&our_fwspec);
+    }
+
+
+SUCCESS!!!
+
+=================
+ONE LAST THING...
+=================
+
+It would be nice if we didn't have to find the irq_domain struct. If you pass 
+NULL into the .fwnode field of the irq_fwspec struct, the 
+irq_create_fwspec_mapping function will try to use a default irq_domain. All 
+the comments in the kernel are saying "don't do it" but I want to try it 
+anyway. After all, there is only one interrupt controller...
+
+Nope, doesn't work. You have to do it the hard way.

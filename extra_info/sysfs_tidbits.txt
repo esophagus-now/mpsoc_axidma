@@ -1,0 +1,41 @@
+This file contains a couple of things I've run into about sysfs.
+
+"Dynamic kobjects"
+    Some sysfs functions (such as kobject_create) will set a kobject's ktype to 
+    be the (globally defined) dynamic_kobj_type. This ktype's sysfs ops are as 
+    follows:
+    
+        /* default kobject attribute operations */
+        static ssize_t kobj_attr_show(struct kobject *kobj, struct attribute *attr,
+                          char *buf)
+        {
+            struct kobj_attribute *kattr;
+            ssize_t ret = -EIO;
+
+            kattr = container_of(attr, struct kobj_attribute, attr);
+            if (kattr->show)
+                ret = kattr->show(kobj, kattr, buf);
+            return ret;
+        }
+        
+        static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr,
+			       const char *buf, size_t count)
+        {
+            struct kobj_attribute *kattr;
+            ssize_t ret = -EIO;
+
+            kattr = container_of(attr, struct kobj_attribute, attr);
+            if (kattr->store)
+                ret = kattr->store(kobj, kattr, buf, count);
+            return ret;
+        }
+    
+    Here's what's going on: these default functions assume that the struct 
+    attribute is stored within a struct kobj_attribute, and will delegate to 
+    the function pointers in that struct.
+    
+    By the way, the release method in this ktype simply frees the kobject and 
+    nothing more.
+
+
+    

@@ -1,0 +1,568 @@
+Let's face it: writing Linux kernel drivers is a pain in the ass. It turns out 
+that there is an easier way: using UIO (Userspace I/O). This lets you write 
+very minimal kernel code, and implement most of your driver in userspace. This 
+is a Good Thing (TM).
+
+This document is based off
+    https://www.slideshare.net/chrissimmonds/quick-and-easy-device-drivers-for-embedded-linux-using-uio
+I essentially copied it, and made a few changes so that it was more applicable 
+to the MPSoCs. Also check out:
+    https://www.kernel.org/doc/html/v4.12/driver-api/uio-howto.html
+
+
+===============
+RUNNING EXAMPLE
+===============
+
+To concretely explain how to use UIO, we will have a running example: writing a 
+UIO driver for an AXI Timer. Make yourself a Vivado project that looks 
+something like this (you can ignore the other ports):
+
+
+     +-----------------------------+     +--------------------------+
+     |                             |     |                          |
+  +->|pl_ps_irq   Zynq PS     M_AXI|---->|S_AXI     AXI    interrupt|--+
+  |  |                          clk|---->|clk      timer            |  |
+  |  |                             |     |                          |  |
+  |  +-----------------------------+     +--------------------------+  |
+  |                                                                    |
+  +--------------------------------------------------------------------+
+
+We only need one timer, so in the parameters for the AXI timer, uncheck "Enable 
+timer 2". Use 0xA0000000 for the AXI timer's base address.
+
+Here is a quick reference of the AXI timer register space):
+ +--------------------------------------------+
+ | OFFSET | NAME     |   MEANING              |
+ +--------------------------------------------+
+ |      0 | TCSR0    | Status + Control       |
+ +--------------------------------------------+
+ |      4 | TLR0     | Timer load register    |
+ +--------------------------------------------+
+ |      8 | TCR0     | Timer counter register |
+ +--------------------------------------------+
+
+The status + control register is laid out as follows:
+
+ +-----------------------------------------------------------------------+
+ | BIT NO.| NAME     |   MEANING                                         |
+ +-----------------------------------------------------------------------+
+ |     11 | CASC     | Enable Cascading mode                             |
+ +-----------------------------------------------------------------------+
+ |     10 | ENALL    | Enable all timers                                 |
+ +-----------------------------------------------------------------------+
+ |      9 | PWMA0    | Enable PWM mode                                   |
+ +-----------------------------------------------------------------------+ 
+ |      8 | T0INT    | 1 if interrupt has occured (0 otherwise)          |
+ +-----------------------------------------------------------------------+ 
+ |      7 | ENT0     | Enable timer                                      |
+ +-----------------------------------------------------------------------+ 
+ |      6 | ENIT0    | Enable interrupt                                  |
+ +-----------------------------------------------------------------------+ 
+ |      5 | LOAD0    | When 1, timer loaded from TLR0 register. Remember |
+ |        |          | to clear it in order to let the timer run!        |
+ +-----------------------------------------------------------------------+ 
+ |      4 | ARHT0    | When 1, timer auto-reloads. Otherwise, it holds   |
+ +-----------------------------------------------------------------------+ 
+ |      3 | CAPT0    | When 1, enables external capture trigger          |
+ +-----------------------------------------------------------------------+ 
+ |      2 | GENT0    | When 1, enable external generate signal           |
+ +-----------------------------------------------------------------------+ 
+ |      1 | UDT0     | When 1, timer counts down (otherwise, up)         |
+ +-----------------------------------------------------------------------+ 
+ |      0 | MDT0     | When 1, timer in caputre mode (o.w., generate)    |
+ +-----------------------------------------------------------------------+ 
+
+We will be using the timer in generate mode. To do this, we:
+    - Write 0 the whole register (disable everything)
+    - Load the period of the timer in TLR0
+    - Write 1 to LOAD0
+    - Write 0 to LOAD0
+    - Write 1 to MDT0 (generate mode), UDT0 (why not), and ARHT0 (why not), as 
+      well as ENT0 (to start the timer) 
+
+
+========
+OVERVIEW
+========
+
+Our job is to write a (very simple) kernel module that performs the following 
+four jobs:
+
+    - Point to the memory region(s) used by our device
+    - Assign the interrupt number
+    - Write a simple interrupt handler
+    - Register all this with UIO
+
+UIO is implemented as an API in the Linux kernel. Like most other APIs, it 
+works using the "registration" idiom; we will fill a struct with information 
+about our device, and call uio_register_device.
+
+UIO will then create /dev/UIOx. A user process can mmap this file to get access 
+to the device register space. Also, a user process can do a (blocking) read on 
+this file to wait for interrupts, or poll the file.
+
+
+===========
+KERNEL CODE
+===========
+
+(Make sure to take a look at compiling_mpsoc_modules.txt for instruction on 
+compiling this code)
+
+Some extra background info:
+    https://www.xilinx.com/support/documentation/user_guides/ug1085-zynq-ultrascale-trm.pdf
+In the interrupts chapter, it mentions that the PL-to-PS interrupts are 
+assigned interrupt numbers 121-128. Now, I happen to know that you have to 
+subtract 32 from this number (huh??? why???). Somewhere along the line, and no 
+I'm not kidding, someone subtracts 32 from the hardware interrupt number before 
+it gets into the kernel. ¯\_(ツ)_/¯
+
+
+Filling uio_info struct
+-----------------------
+
+The first thing we'll do is fill in the uio_info struct. Note that we use 
+interrupt number 89; this is the number for the first PL to PS interrupt line.
+
+    static struct uio_info axi_timer = {
+        .name = "mpsoc_axitimer",
+        .version = "1.0",
+        .irq = 89,
+        .irq_flags = IRQF_SHARED,
+        .handler = axitimer_irq //See below
+    };
+
+
+
+Sepcifying memory regions
+--------------------------
+
+This struct also has an array (called mem) of uio_mem structs, which tell UIO 
+about what memory regions we want to map. The C language doesn't let us specify 
+them here*, so we'll initialize them separately and write them in using the init 
+function.
+
+  *The C language does have a way to initialize particular elements of arrays 
+  (within structs), but the compiler options used by the Linux kernel's build 
+  system don't enable it.
+
+Anyway, we only need one memory region:
+
+    static struct uio_mem axi_timer_regs = {
+        .name = "axi_timer_regs",
+        .memtype = UIO_MEM_PHYS,
+        .addr = 0xA0000000,
+        .size = 4*4
+    };
+
+See the module init function to find out how we add this into the uio_info 
+struct.
+
+
+Writing the interrupt handler
+-----------------------------
+
+The last UIO-related task we have to do is write an interrupt handler. We need 
+to ensure that this interrupt was destined for us before telling the Linux 
+kernel that the IRQ was handled.
+
+In this code, the T0INT_MASK macro and virt variable are initialized elsewhere.
+    
+    static uint32_t *virt; //Will be set by module init function
+    
+    static irqreturn_t axitimer_irq(int irq, struct uio_info *dev) {
+        //Check if this interrupt was for us
+        uint32_t status = *virt;
+        
+        printk(KERN_INFO "axitimer_irq called\n");
+        
+        if (status & T0INT_MASK) {
+            printk(KERN_INFO "axitimer interrupt handled\n");
+            //This interrupt was for us. Clear the T0INT bit
+            virt[0] |= T0INT_MASK;
+            return IRQ_HANDLED; //Signal to kernel that interrupt was handled
+        }
+        
+        return IRQ_NONE; //Interrupt wasn't for us; tell Linux to try other handlers
+    }
+
+
+Irritating business involving device structs
+--------------------------------------------
+
+Unfortunately for us, for some reason UIO forces us to give it a struct device 
+when we register our UIO device. So we build a dummy one with the bare minimum 
+to pass the requirements:
+
+    static void dummy_release(struct device *dev) {
+        printk(KERN_INFO "There, it's released, OK???\n");
+        return;
+    }
+
+    //UIO forces us to make a struct device. Anyway, I guess it's worth doing, since
+    //it will make nice sysfs entries...
+    static struct device axitimer_dev = {
+        .init_name = "axitimer",
+        .release = dummy_release
+    };
+
+
+EXTREMELY irritating business involving IRQ numbers
+---------------------------------------------------
+
+This is a very long discussion. Basically, you need to do a lot of acrobatics 
+to get the correct IRQ number to use with UIO. See interrupt_numbers.txt for 
+details.
+
+It boils down to calling irq_create_fwspec_mapping. This function returns the 
+correct irq number, and creating some internal kernel structures if necessary. 
+The code that does that is as follows:
+
+    struct device_node *dn;
+    struct irq_domain *dom;
+    struct irq_fwspec dummy_fwspec = {
+        .param_count = 3,
+        .param = {0, 89, 4} //change 89 to number for your device
+    };
+    int virq;
+    
+    //Find the Linux irq number
+    dn = of_find_node_by_name(NULL, "interrupt-controller");
+    if (!dn) {
+        printk(KERN_ERR "Could not find device node for \"interrupt-controller\"\n");
+        goto /*error_handler*/;
+    }
+    dom = irq_find_host(dn);
+    if (!dom) {
+        printk(KERN_ERR "Could not find irq domain\n");
+        goto /*error_handler*/;
+    }
+    
+    dummy_fwspec.fwnode = dom->fwnode;
+    virq = irq_create_fwspec_mapping(&dummy_fwspec);
+
+
+
+Final code
+----------
+
+So, finally, we can put all this together in a single module. This takes all 
+the code segments from above, and adds module init and exit functions. The init 
+function takes care of:
+
+    - Getting a virtual address for the AXI Timer status register (the "virt" 
+    variable used in our interrupt handler)
+    
+    - Disabling the timer (just in case)
+    
+    - Adding the uio_mem struct into the uio_info struct
+    
+    - Creating a dummy device struct (I wish we didn't have to do this)
+    
+    - Registering it all with UIO.
+    
+There might be a way to avoid making a device struct, and if you find out what 
+it is, let me know!
+
+    #include <linux/kernel.h> //print functions
+    #include <linux/init.h> //for __init, see code
+    #include <linux/module.h> //for module init and exit macros
+    #include <linux/interrupt.h> //IRQF_SHARED
+    #include <linux/uio_driver.h> //UIO stuff
+    #include <linux/device.h> //For struct device
+    #include <asm/io.h> //For ioremap
+    #include <linux/irqdomain.h> //For irq_find_host
+    #include <linux/of.h> //For device tree struct types
+    #include <linux/irq.h> //For irq_desc struct and irq_to_desc
+
+    #define T0INT_SHIFT (8)
+    #define T0INT_MASK (1 << T0INT_SHIFT)
+    #define AXITIMER_BASE (0xA0000000)
+
+    //Hang onto kernel virtual address for AXI timer regs
+    static volatile uint32_t *virt;
+
+    static irqreturn_t axitimer_irq(int irq, struct uio_info *dev) {
+        //Check if this interrupt was for us
+        uint32_t status = *virt;
+        
+        printk(KERN_INFO "axitimer_irq called\n");
+        
+        if (status & T0INT_MASK) {
+            printk(KERN_INFO "axitimer interrupt handled\n");
+            //This interrupt was for us. Clear the T0INT bit
+            virt[0] |= T0INT_MASK;
+            return IRQ_HANDLED; //Signal to kernel that interrupt was handled
+        }
+        
+        return IRQ_NONE; //Interrupt wasn't for us; tell Linux to try other handlers
+    }
+
+    static struct uio_info axi_timer = {
+        .name = "mpsoc_axitimer",
+        .version = "1.0",
+        //.irq = 89, //See "smarter" irq number finding code in init function
+        .irq_flags = IRQF_SHARED,
+        .handler = axitimer_irq,
+        .mem = {
+            {.name = "axi_timer_regs", .memtype = UIO_MEM_PHYS, .addr = AXITIMER_BASE, .size = 16}
+        }
+    };
+
+    static struct uio_mem axi_timer_regs = {
+        .name = "axi_timer_regs",
+        .memtype = UIO_MEM_PHYS,
+        .addr = AXITIMER_BASE,
+        .size = 0x1000
+    };
+
+    static void dummy_release(struct device *dev) {
+        printk(KERN_INFO "There, it's released, OK???\n");
+        return;
+    }
+
+    //UIO forces us to make a struct device. Anyway, I guess it's worth doing, since
+    //it will make nice sysfs entries...
+    static struct device axitimer_dev = {
+        .init_name = "axitimer",
+        .release = dummy_release
+    };
+
+    static int __init our_init(void) {     
+        int rc = 0;
+        struct device_node *dn;
+        struct irq_domain *dom;
+        int virq;
+        struct irq_fwspec dummy_fwspec = {
+            .param_count = 3,
+            .param = {0, 89, 4}
+        };
+        
+        //Perform IO remapping
+        virt = ioremap_nocache(AXITIMER_BASE, 4);
+        if (virt == NULL) {
+            printk(KERN_ERR "Could not remap device memory\n");
+            rc = -ENOMEM;
+            goto axitimer_err_remap;
+        }
+        
+        *virt = 0; //Disable the timer
+        
+        //Create the struct device for the axi timer
+        rc = device_register(&axitimer_dev);
+        if (rc < 0) {
+            printk(KERN_ERR "Could not register device with kernel\n");
+            goto axitimer_err_device_register;
+        }    
+        
+        //Find the Linux irq number
+        dn = of_find_node_by_name(NULL, "interrupt-controller");
+        if (!dn) {
+            printk(KERN_ERR "Could not find device node for \"interrupt-controller\"\n");
+            goto axitimer_err_device_register;
+        }
+        dom = irq_find_host(dn);
+        if (!dom) {
+            printk(KERN_ERR "Could not find irq domain\n");
+            goto axitimer_err_device_register;
+        }
+        
+        dummy_fwspec.fwnode = dom->fwnode;
+        virq = irq_create_fwspec_mapping(&dummy_fwspec);
+        
+        if (virq <= 0) {
+            printk(KERN_ERR "Could not allocate irq\n");
+            if (virq == 0) {
+                rc = -ECANCELED;
+            } else {
+                rc = virq;
+            }
+            
+            goto axitimer_err_device_register;
+        }    
+        
+        //Finish setting up uio_info struct
+        axi_timer.irq = virq;
+        axi_timer.mem[0] = axi_timer_regs;
+        //Register with UIO
+        rc = uio_register_device(&axitimer_dev, &axi_timer);
+        if (rc < 0) {
+            printk(KERN_ERR "Could not register device with UIO\n");
+            device_unregister(&axitimer_dev);
+            iounmap(virt);
+            return rc; //Propagate error code
+        }
+        
+        printk(KERN_INFO "AXI timer driver inserted!\n"); 
+        return 0;
+        
+        axitimer_err_device_register:
+        iounmap(virt);
+        axitimer_err_remap:
+        return rc;
+    } 
+
+    static void our_exit(void) { 
+        //Unregister with UIO
+        uio_unregister_device(&axi_timer);
+        
+        //Unregister device
+        device_unregister(&axitimer_dev);
+        
+        //Unmap IO memory
+        iounmap(virt);
+        
+        printk(KERN_INFO "AXI timer driver removed!\n"); 
+    } 
+
+    MODULE_LICENSE("Dual BSD/GPL"); 
+
+    module_init(our_init); 
+    module_exit(our_exit);
+
+
+
+It's so ugly... but as far as I know there is no easier way.
+
+
+=========
+USER CODE
+=========
+
+Anyway, we're done all the dirty work. Now we can write a totally ordinary 
+userspace program:
+
+    #include <stdio.h>
+    #include <fcntl.h> //open
+    #include <sys/mman.h> //mmap
+    #include <unistd.h> //close
+    #include <stdint.h>
+
+
+    typedef struct {
+        unsigned    MD      :1; //When 1, timer in generate mode (o.w., capture) 
+        unsigned    UD      :1; //When 1, timer counts down (otherwise, up) 
+        unsigned    GEN     :1; //When 1, enable external generate signal 
+        unsigned    CAP     :1; //When 1, enables external capture trigger  
+        unsigned    ARH     :1; //When 1, timer auto-reloads. Otherwise, it holds 
+        unsigned    LOAD    :1; //When 1, timer loaded from TLR register. Remember to clear it in order to let the timer run! 
+        unsigned    ENI     :1; //Enable interrupt  
+        unsigned    EN      :1; //Enable timer 
+        unsigned    INT     :1; //1 if interrupt has occured (0 otherwise)
+        unsigned    PWM     :1; //Enable PWM mode 
+        unsigned    ENALL   :1; //Enable all timers
+        unsigned    CASC    :1; //Enable Cascading mode
+        unsigned            :20; //Pad up to 32 bits
+    } TCSR_bits;
+
+    typedef struct {
+        TCSR_bits TCSR;
+        uint32_t TLR;
+        uint32_t TCR;
+    } axitimer_regs;
+
+    TCSR_bits disable = {
+        .MD      = 0,
+        .UD      = 0,
+        .GEN     = 0,
+        .CAP     = 0,
+        .ARH     = 0,
+        .LOAD    = 0,
+        .ENI     = 0,
+        .EN      = 0,
+        .INT     = 1, //Writing one will clear any leftover interrupts
+        .PWM     = 0,
+        .ENALL   = 0,
+        .CASC    = 0,
+    };
+
+    TCSR_bits load = {
+        .MD      = 0,
+        .UD      = 0,
+        .GEN     = 0,
+        .CAP     = 0,
+        .ARH     = 0,
+        .LOAD    = 1,
+        .ENI     = 0,
+        .EN      = 0,
+        .INT     = 0,
+        .PWM     = 0,
+        .ENALL   = 0,
+        .CASC    = 0,
+    };
+
+    TCSR_bits one_int_per_sec = {
+        .MD      = 0,
+        .UD      = 1,
+        .GEN     = 0,
+        .CAP     = 0,
+        .ARH     = 1,
+        .LOAD    = 0,
+        .ENI     = 1,
+        .EN      = 1,
+        .INT     = 0, 
+        .PWM     = 0,
+        .ENALL   = 1,
+        .CASC    = 0,
+    };
+
+    uint32_t period_1s = 100000000; //Clock is at 100MHz
+
+    #define MAP_SIZE (0x1000)
+
+    int main(int argc, char **argv) {
+        int ret = 0;
+        int fd = -1;
+        volatile axitimer_regs *base = MAP_FAILED;
+        
+        printf("%x\n", *((uint32_t*)(&one_int_per_sec)));
+        
+        if (argc != 2) {
+            puts("Please give the device file as an argument to this program");
+            return 0;
+        }
+        
+        fd = open(argv[1], O_RDWR);
+        if (fd == -1) {
+            char line[80];
+            snprintf(line, 79, "Could not open %s\n", argv[1]);
+            perror(line);
+            ret = -1;
+            goto cleanup;
+        }
+        
+        base = (volatile axitimer_regs *) mmap(0, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) {
+            perror("Could not mmap device memory");
+            ret = -1;
+            goto cleanup;
+        }
+        
+        base->TCSR = disable;
+        base->TLR = period_1s;
+        base->TCSR = load;
+        base->TCSR = one_int_per_sec;
+        
+        unsigned pending;
+        
+        int i;
+        for (i = 0; i < 10; i++) {
+            puts("Waiting for interrupt");
+            fflush(stdout);
+            read(fd, &pending, sizeof(pending));
+            printf("Current time value is %u\n", base->TCR);
+        }
+            
+        
+        
+        cleanup:
+        if (base != MAP_FAILED) {
+            base->TCSR = disable;
+            munmap((void*)base, MAP_SIZE);
+        }
+        if (fd != -1) close(fd);
+        
+        return ret;
+    }
+

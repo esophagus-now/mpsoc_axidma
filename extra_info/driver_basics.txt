@@ -1,0 +1,511 @@
+/*Below this write-up is skeleton of a simple character driver. In order
+for it all to make sense, I've left this large comment block at the 
+beginning to tell you what to look for. I've left extra discussions at
+the end as well
+
+To understand how to write a driver, we need to briefly go on a tangent.
+Don't feel too intimidated by the size of the section: the large three
+indented paragraphs can be skipped.
+
+============================
+THE VIRTUAL FILESYSTEM (VFS)
+============================
+
+What happens when you open, read, write, close, etc. a file? Normally, 
+this triggers reads and writes to the hard drive, but Linux's design is 
+actually much more intelligent.
+
+The open() system call looks like this:
+
+ int open(const char *pathname, int flags);
+
+When you call this function, you give it a file path (as a string) as 
+the first argument. (The flags are for saying whether you plan to read,
+write, and whatever else you want). The Linux kernel will then take that 
+string and look it up.
+
+I don't want to get into too much detail, but the end goal of a file 
+lookup is finding a data structure which is called "struct file". 
+(defined in include/linux/fs.h in the kernel source tree). Believe it 
+or not, your entire filesystem is essentially one big graph (i.e. a 
+"nodes and edges" graph) made out of structs with pointers to other 
+structs; eventually, by using bits and pieces of your filepath string, 
+the kernel will traverse this representation of the filesystem in order 
+to find your file.
+
+	Yes, of course this is an oversimplification. Obviously this would
+	consume a huge amount of RAM. Instead, the structs which make up
+	the nodes of this graph contain pointers to functions. When the
+	kernel wishes to traverse from part of the graph to another (for 
+	example, suppose it is at the node that represents the "/home/tom"
+	directory) it will call a specific one of those functions (for
+	example, the function which scans all the edges coming out of a 
+	directory node and returns a pointer to the one it was asked for [or
+	in other words, findingg a file in a directory])
+	
+	Here's the key insight that makes the VFS so elegant and flexible:
+	it is up to the designer of a filesystem to implement these functions.
+	They can do anything the designer wants! They could just make the
+	computer print out silly messages, or make the speakers beep.... or
+	maybe access the disk drive. That's right: instead of keeping the 
+	entire graph representing your filesystem in RAM, it is loaded from
+	the disk whenever you traverse an edge between nodes. The kernel is 
+	very smart about keeping a certain number of node structs cached in 
+	RAM based on what you're accessing most often (otherwise performance
+	would be terrible)
+	
+	And this is how different filesystems are implemented. The NTFS 
+	filesystem code will essentially read certain bytes from the hard 
+	drive and fill up node structures (called inodes) as the kernel asks
+	for them. The ext4 driver does the exact same thing (although the
+	on-disk representation of ext4 closely matches the in-memory 
+	representation of inodes, and this no accident; the ext4 driver
+	doesn't have to do much more than load the data into memory). When it
+	comes to in-memory filesystems like /proc and /sysfs, the inodes are
+	literally always stored in RAM and traversing them is a simple 
+	pointer dereference.
+
+It turns out that a struct file contains a struct file_operations in it.
+The definition of struct file_operations is in include/linux/fs.h in the
+kernel source tree, and an excert is shown here:
+
+	struct file_operations {
+		struct module *owner;
+		int (*open) (struct inode *, struct file *);
+		loff_t (*llseek) (struct file *, loff_t, int);
+		ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+		ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+		__poll_t (*poll) (struct file *, struct poll_table_struct *);
+		int (*mmap) (struct file *, struct vm_area_struct *);
+		int (*release) (struct inode *, struct file *);
+		//... and about 20 other  function pointers
+	}
+
+Here's the kicker: when you do any one of the open(), read(), write(), 
+etc. system calls related to a specific file, the kernel will eventually
+call the function specified in the file_operations struct. If you wanted,
+every file could do different things when you read it.
+
+That's where character drivers come in: we will be adding a file to the
+filesystem (yes, you can see it in your file manager) but we will supply
+our own functions. That way, whenever a user opens the file, it will
+call out open function. When the user reads, it calls our read function,
+and so on. Importantly, our functions run in the kernel, with full 
+permission to do whatever we want with the hardware.
+
+
+============================================
+THE BASIC PARTS OF A CHARACTER DEVICE DRIVER
+============================================
+
+We want to do three things:
+
+1) Make our own open, read, write, etc. functions that will do something
+interesting
+
+2) Add a new file into the filesystem whose file operations point to our
+interesting functions
+
+3) Put all this into a dynamically loadable kernel module
+
+To do 1), we'll define all the functions we plan to make, and slot them 
+into a file operations struct. 
+
+To do 2), we will put our file operations struct and some metadata 
+(like the filename and file permissions we want) into a miscdevice 
+struct. This struct is used in a call to misc_device_register, and 
+provides it with all the information it needs to create the device 
+file. The file will be in both /dev and in /sys/class/misc, with the 
+name and permissions we asked for. 
+
+To do 3), we have to write a module init and module exit function, 
+which are called when the module is loaded and unloaded from the kernel 
+(respectively). To tell the compiler which of our functions are these 
+special module-related functions, we use some black magic macros from 
+<linux/module.h>. We also use some macros to add module metadata (such 
+as license and author info)
+
+*/
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////
+
+#include <linux/fs.h> //struct file, struct file_operations
+#include <linux/init.h> //for __init, see code
+#include <linux/module.h> //for module init and exit macros
+#include <linux/miscdevice.h> //for misc_device_register and struct micdev
+#include <linux/uaccess.h> //For copy_to_user, see code
+
+///////////////// PART 1: DEFINING OUR FILE OPERATIONS /////////////////
+
+//Forward-declare our file operations:
+static int our_open (struct inode *inode, struct file *filp);
+static int our_release (struct inode *inode, struct file *filp);
+static ssize_t our_read (struct file *filp, char __user *buf, size_t sz, loff_t *off);
+
+static struct file_operations our_fops = { //Holds pointers to our functions
+	.open = our_open,
+	.release = our_release, //This is what the close() function calls
+	.read = our_read
+};
+
+//The function signature for our file operations can be pulled directly
+//from the file operations struct
+static int our_open (struct inode *inode, struct file *filp) {
+	//The first argument is the inode "responsible" for our device file,
+	//and the second is the struct file that describes it. In particular,
+	//its file_operations struct points to our file operations struct
+	
+	if (filp->f_op == &our_fops) {
+		printk(KERN_ALERT "Opened our device file! Everything looks okay!\n");
+	} else {
+		printk(KERN_ERR "Opened our device file, but something looks wrong...\n");
+	}
+	
+	//Most open functions you write will typically keep track of how 
+	//many people are usign a device file. For most io devices, you 
+	//usually only want one process using them at a time; you can
+	//return -EBUSY;
+	//to have any new openers of your device file fail their open call
+	
+	return 0; //SUCCESS
+}
+
+static int our_release (struct inode *inode, struct file *filp) {
+	printk(KERN_ALERT "Thank you for using our device driver!\n");
+	
+	return 0;
+}
+
+//read() and write() functions are definitely more complicated. For
+//starters, the pointer passed as the second argument is a pointer into
+//the user's virtual memory area, which means we CANNOT dereference it!
+//This example just returns "Lorem Ipsum" into the buffer indicated by
+//the user in order to show how to move data to userspace safely
+static ssize_t our_read (struct file *filp, char __user *buf, size_t sz, loff_t *off) {
+	//The first parameter is our own file pointer. I'm not sure what we
+	//would do with it, to be honest
+	
+	//The second paramater is a userspace virtual address which, for them,
+	//pointe to a memory buffer they want us to read into
+	
+	//The third parameter is the number of bytes they are trying to read
+	
+	//The fourth parameter is the offset. See, when a user calls read 
+	//over and over again, they expect to be reading sequentially through
+	//the file. We will maintain the offset.
+	
+	//We must return the number of bytes we wrote into the user's buffer
+	
+	static char msg[] = "Lorem Ipsum\n";
+	#define msg_len (sizeof(msg))
+	
+	//The user could want to read something much larger than the message,
+	//or much smaller. We need to be flexible and be able to read the
+	//message in parts (and without going out of bounds)
+	int sz_left = (int)msg_len - (int)*off; //Casting to int for safety
+	
+	//Pick the minimum of sz or sz_left
+	int sz_to_send = (int) sz > sz_left ? sz_left : sz;
+	
+	if (sz_to_send <= 0) {
+		//The user has read the entire message. First, reset the offset...
+		*off = 0;
+		//... and return 0. Most user programs (e.g. cat), will call the
+		//read function in a while loop until it returns 0
+		
+		return 0;
+	} else {
+		//Otherwise, send the correct portion of our buffer back to the
+		//user
+		copy_to_user(buf, msg + *off, sz_to_send);
+		
+		//Maintain the offset
+		*off += sz_to_send;
+		
+		//We wrote sz_to_send bytes
+		return sz_to_send;
+	}
+}
+
+////////////////// PART 2: CREATING THE DEVICE FILES ///////////////////
+
+//This struct contains all the details needed to hook up our operations
+//to a real file in the filesystm
+static struct miscdevice our_miscdev = { 
+	.minor = MISC_DYNAMIC_MINOR, 
+	.name = "our_driver",
+	.fops = &our_fops,
+	.mode = 0666
+};
+
+//Something I haven't talked about yet: every device file has unique 
+//device numbers. They consist of a "major number" and a "minor number",
+//and you can see them if you do ls -l on a device file. For example,
+/*
+ * $ ls -l /dev/sda1 
+ * brw-rw---- 1 root disk 8, 1 Oct 18 21:41 /dev/sda1
+ */
+//This tells me the /dev/sda1 device file has major number 8 and minor
+//number 1. Honestly, I'm not really sure how these are used by the 
+//kernel, but as far as I know they're used to associate a device file 
+//with the driver that controls it. In this case, our device file will
+//actually share the same major number as all the other misc drivers on
+//the system, but it can choose its own minor number. I don't care what
+//my device number is, so I just ask misc_driver_register to choose one
+//for me
+
+//By the way, the mode field of this struct is the permissions for the 
+//file. Note we use the rarely-seen octal prefix!
+
+//The next step is to actually register our driver. This will be done in
+//the module init function in the next section. However, we need to keep
+//track of when we have been succesfully registered or not:
+static int registered = 0;
+
+/////////////////// PART 3: MAKING IT INTO A MODULE ////////////////////
+
+//The __init is some magic compiler directive that tells it to free the
+//memory used for this function once it is run. Init functions are only
+//ever run once, so there's no need to keep them around
+static int __init our_init(void) { 
+	//The init function is the perfect place to register our driver
+	//(actually, it's the only place that makes sense)
+	
+	int err = misc_register(&our_miscdev);
+	if (err < 0) {
+		printk(KERN_ERR "Could not register misc device\n");
+	} else {
+		printk(KERN_ALERT "Hello, world!\n"); 
+		registered = 1;
+	}
+	
+	return err; //Propagate error code
+} 
+
+static void our_exit(void) { 
+	//In order to be good citizens, we free up resources when we're not
+	//using them, so unregister our device file
+	
+	if (registered) misc_deregister(&our_miscdev);
+	
+	printk(KERN_ALERT "Goodbye, cruel world!\n"); 
+} 
+
+MODULE_LICENSE("Dual BSD/GPL"); 
+
+module_init(our_init); 
+module_exit(our_exit);
+
+
+////////////////////////////////////////////////////////////////////////
+
+
+
+
+
+
+// EXTRA NOTES
+// -----------
+
+/*
+(See next note for compilation details)
+
+To use this module, I recommend opening a separate terminal and running
+$ dmesg -w
+which will give you a live view of kernel messages.
+
+Then in a separate terminal, run:
+$ sudo insmod our_device.ko
+$ cat /dev/our_device
+$ sudo rmmod our_device
+*/
+
+/*
+As hinted earlier, compiling modules is not a simple job; the machine 
+code has to be put together in a very particular way. Luckily, the 
+kernel developers have come up with a relatively painless way to do 
+this; they have a special makefile that comes with your kernel, which 
+takes care of doing the really complicated stuff. I don't really know 
+the details of using it, but for simple drivers, it looks like this:
+
+	# If KERNELRELEASE is defined, we've been invoked from the 
+	# kernel build system and can use its language. 
+	ifneq ($(KERNELRELEASE),) 
+		obj-m := NAME_OF_YOUR_C_FILE.o 
+	# Otherwise we were called directly from the command 
+	# line; invoke the kernel build system. 
+	else 
+		KERNELDIR ?= /usr/lib/modules/$(shell uname -r)/build 
+		PWD := $(shell pwd) 
+
+	default: 
+		$(MAKE) -C $(KERNELDIR) M=$(PWD) modules 
+
+	clean:
+		$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+		
+	endif
+
+*/
+
+
+
+
+/*
+
+Using misc drivers really makes life easier. Without it, you have to do 
+a ton of really annoying extra steps, like allocating your own device 
+nnumber, filling in a bunch of annoyign structs, calling several 
+registration functions, error-checking each one, of course...
+
+For posterity, here is an example of a simple driver which uses the more
+conventional method:
+
+#include <linux/init.h>
+#include <linux/module.h> 
+#include <linux/types.h> //dev_t, umode_t
+#include <linux/fs.h> //alloc_chrdev_region, etc.
+#include <linux/cdev.h> //for cdev structure
+#include <linux/device.h> //For struct class and struct device (and associated functions)
+
+#define ATTEMPT(x) if((x) < 0)
+#define IF_FAILED
+
+MODULE_LICENSE("Dual BSD/GPL"); 
+
+//Character device data
+static dev_t mynum;
+static char mynum_allocated = 0;
+static struct file_operations fops;
+static struct cdev mycdev;
+static char mycdev_added = 0;
+
+//Stuff to get the driver to show up in sysfs
+static struct class *myclass;
+static char myclass_created = 0;
+static struct device *mydev;
+static char mydev_created = 0;
+
+//The way to set permissions on /dev files (when using device_create)
+//is to hook up a callback in the class that the device belongs to.
+//This way, you can select different permissions for different device
+//files.
+static char *devnode_permissions(struct device *dev, umode_t *mode) {
+	//apparently, mode can be null
+	if (mode == NULL) return NULL; //Just in case
+	*mode = 0666; //The seldom-used octal prefix!
+	
+	return NULL;
+}
+
+static int __init my_init(void) { 
+	printk(KERN_ALERT "Hello, world\n"); 
+	
+	//A device file needs a device number, so allocate one.
+	ATTEMPT(alloc_chrdev_region(&mynum, 0, 1, "mychardev")) 
+	IF_FAILED {
+		printk(KERN_ERR "Could not allocate a device number. mychardev not activated.\n"); 
+		goto chardev_abort;
+	} else {
+		printk(KERN_ALERT "Allocated device number: %d, %d\n", MAJOR(mynum), MINOR(mynum));
+		mynum_allocated = 1;
+	}
+	
+	//Register some file operations to our cdev struct
+	cdev_init(&mycdev, &fops); //Hook up our function pointers into the cdev
+	mycdev.owner = THIS_MODULE;
+	//Now ask the kernel to hook up this driver with the device number
+	ATTEMPT(cdev_add(&mycdev, mynum, 1))
+	IF_FAILED {
+		printk(KERN_ERR "Could not add cdev.\n"); 
+		goto chardev_abort;
+	} else mycdev_added = 1;
+	
+	//At this point, the driver is ready, but we'll go to the extra trouble
+	//of hooking it up to sysfs. On the bright side, this will also create 
+	//the entry in /dev
+	//First we need to do this funny class business
+	ATTEMPT(myclass = class_create(THIS_MODULE, "marco_class"))
+	IF_FAILED {
+		printk(KERN_ERR "Could not create sysfs class.\n"); 
+		goto chardev_skip_sysfs;
+	} else myclass_created = 1;
+	//Extra business: get this new class to set 0666 permissions on /dev files
+	myclass->devnode = devnode_permissions;
+	//And now we do what we really want: device_create is what adds the
+	//entry into sysfs and makes the device file in /dev
+	ATTEMPT(mydev = device_create(myclass, NULL, mynum, NULL, "mychardev"))
+	IF_FAILED {
+		printk(KERN_ERR "Could not create device in /sys or in /dev.\n"); 
+	} else mydev_created = 1;
+	
+	chardev_skip_sysfs:
+	
+	return 0; 
+	
+	chardev_abort:
+	
+	if (mydev_created) {
+		device_destroy(myclass, mynum); //Weird... device_destroy doesn't take a pointer to the struct device...
+		mydev_created = 0;
+	}
+	
+	if (myclass_created) {
+		class_destroy(myclass);
+		myclass_created = 0;
+	}
+	
+	if (mycdev_added) {
+		cdev_del(&mycdev);
+		mycdev_added = 0;
+	}
+	
+	if (mynum_allocated) {
+		unregister_chrdev_region(mynum, 1);
+		mynum_allocated = 0;
+	}
+	
+	return -1;
+} 
+
+static void my_exit(void) { 
+	if (mydev_created) {
+		device_destroy(myclass, mynum); //Weird... device_destroy doesn't take a pointer to the struct device...
+		mydev_created = 0;
+	} else {
+		printk(KERN_ALERT "Warning: device files were never created\n"); 
+	}
+	
+	if (myclass_created) {
+		class_destroy(myclass);
+		myclass_created = 0;
+	} else {
+		printk(KERN_ALERT "Warning: sysfs class was never created\n"); 
+	}
+	
+	if (mycdev_added) {
+		cdev_del(&mycdev);
+		mycdev_added = 0;
+	} else {
+		printk(KERN_ALERT "Warning: cdev was never added\n"); 
+	}
+	
+	if (mynum_allocated) {
+		unregister_chrdev_region(mynum, 1);
+		mynum_allocated = 0;
+	} else {
+		printk(KERN_ALERT "Warning: device number was never allocated\n"); 
+	}
+	
+	printk(KERN_ALERT "Goodbye, cruel world\n"); 
+} 
+
+module_init(my_init); 
+module_exit(my_exit);
+
+
+*/
