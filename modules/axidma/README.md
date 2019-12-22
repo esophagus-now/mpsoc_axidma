@@ -18,7 +18,7 @@ involving TLAST, for example), so we'll cover those. Finally, I'll briefly
 explain what's going on when you use the driver from userspace.
 
 
-# Inserting and Configuring the Drier
+# Inserting and Configuring the Driver
 
 Inserting the driver is the same as anything else: 
 

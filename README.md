@@ -5,6 +5,18 @@ A complete AXI DMA solution (for the Zynq MPSoC) that does not require you to
 write a device tree overlay.
 
 
+# Updates
+
+After reading some stuff in ldd3 (https://lwn.net/Kernel/LDD3/) I might have 
+discovered why the caching isn't working properly: the `dma_map_*` functions 
+don't play nicely when you only want to map a fraction of a page. When I get 
+back to Toronto I can see if changing this fixes the problem. Specifically, all 
+you would have to do is, when building the scatterlist in the `pinner` driver, 
+is do map the entire page even if only a fraction of it is needed. 
+
+Alternatively, one could use `poix_memalign` in user space and always allocate 
+an integer number of pages,
+
 # The new AXIDMA library
 
 This repo is meant to be a general attempt to make the AXI DMA easier to use. 
