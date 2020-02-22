@@ -158,7 +158,15 @@ static int pinner_alloc_and_fill_sglist(struct page **page_arr, int num_pages,
     } else {
         first_page_sz = PAGE_SIZE - first_page_offset;
     }
-    sg_set_page(&(p->sglist[0]), page_arr[0], first_page_sz, first_page_offset);
+    //Technically, we should do:
+    //
+    //sg_set_page(&(p->sglist[0]), page_arr[0], first_page_sz, first_page_offset);
+    //
+    //However, the sg_set_page function doesn't correctly turn off caching for 
+    //fractions of a page. So, we artifically map the entire page. This will 
+    //have the effect os disabling the cache for everything in the page, but I
+    //don't see any other way to fix it
+    sg_set_page(&(p->sglist[0]), page_arr[0], PAGE_SIZE, 0);
     p->sglist[0].dma_address = page_to_phys(page_arr[0]);
     //Middle pages
     for (i = 1; i < num_pages - 1; i++) {
@@ -166,10 +174,13 @@ static int pinner_alloc_and_fill_sglist(struct page **page_arr, int num_pages,
         p->sglist[i].dma_address = page_to_phys(page_arr[i]);
     }
     //Last page
+    //Same thing: we artifically map the entire page. Normally, we would only
+    //map (total_sz - (PAGE_SIZE - first_page_offset) - (num_pages-2)*PAGE_SIZE)
+    //bytes of the last page.
     if (num_pages > 1) {
         sg_set_page(
             &(p->sglist[num_pages-1]), page_arr[num_pages-1],
-            total_sz - (PAGE_SIZE - first_page_offset) - (num_pages-2)*PAGE_SIZE,
+            PAGE_SIZE,
             0
         );
         p->sglist[num_pages-1].dma_address = page_to_phys(page_arr[num_pages-1]);

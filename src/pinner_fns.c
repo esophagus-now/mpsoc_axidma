@@ -68,8 +68,7 @@ int flush_buf_cache(int fd, struct pinner_handle *h) {
     if (n < 0) {
         perror("Could not write pin command to pinner");
         return -1;
-    }    
-    sleep(3); //So aboslutely none of those kernel functions flush the cache...
+    }
     return 0;
 }
 
